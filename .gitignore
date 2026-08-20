@@ -1,0 +1,22 @@
+# Секреты и локальные настройки
+.env
+
+# Артефакты прогона
+downloads/
+prompts.txt
+failed_chunks.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Диагностические/тестовые логи (корень и debug/logs)
+_*.log
+debug/logs/*
+
+# Боевой лог ударений — версионируем
+!stress_mismatches.log
+
+# Кэш конвертации U+0301 → '+' для StressRNN (генерируется из exception_dictionary.txt)
+*.stressrnn.txt
