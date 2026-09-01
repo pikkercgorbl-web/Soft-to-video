@@ -9,3 +9,7 @@ soundfile>=0.12.1
 protobuf>=6.31.1,<8
 # Офлайн-проверка ударений Gemini (StressRNN + словарь Зализняка)
 stressrnn @ git+https://github.com/dbklim/StressRNN.git
+# Опционально: MEDIA_RANKER=embedding (ранжирование клипов без обращений к LLM).
+# Тянет torch, поэтому не ставится по умолчанию; при отсутствии пакета
+# ранжирование откатывается на лексическое, пайплайн не падает.
+# sentence-transformers>=2.2.0

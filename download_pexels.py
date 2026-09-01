@@ -28,6 +28,21 @@ import requests
 from google import genai
 from dotenv import load_dotenv
 
+from media_semantic import (
+    EmbeddingRanker,
+    MediaCandidate,
+    MediaSelectionLog,
+    SelectionOutcome,
+    UsedMediaStore,
+    VisualBrief,
+    build_ranking_prompt,
+    build_visual_brief_prompt,
+    extract_caption,
+    parse_ranking_choice,
+    parse_visual_brief,
+    rank_lexically,
+)
+
 # ==========================================
 # 🎛️ НАСТРОЙКИ ГОЛОСА CHATTERBOX
 # ==========================================
@@ -38,6 +53,18 @@ TTS_SPEED_FACTOR = 1.0         # Скорость
 TTS_TEMPERATURE = 0.8          # Креативность
 TTS_EXAGGERATION = 1.3         # Эмоциональность
 TTS_CFG_WEIGHT = 0.5           # Строгость следования тексту
+# ==========================================
+
+# ==========================================
+# 🎬 СМЫСЛОВОЙ ПОДБОР ВИДЕОРЯДА
+# ==========================================
+MEDIA_SEMANTIC_ENABLED = True          # визуальное описание сцены + ранжирование кандидатов
+MEDIA_CANDIDATE_POOL = 10              # сколько кандидатов собирать на ранжирование
+MEDIA_RANKER = "llm"                   # llm | embedding | lexical
+MEDIA_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+USED_MEDIA_STORE = "used_media.json"   # персистентный реестр использованных клипов
+MEDIA_SELECTION_LOG = "media_selection.log"
+# Переопределение через .env: MEDIA_SEMANTIC_ENABLED, MEDIA_CANDIDATE_POOL, MEDIA_RANKER
 # ==========================================
 
 # ==========================================
@@ -87,20 +114,13 @@ GEMINI_MODEL = "gemini-2.5-flash"
 
 
 @dataclass
-class FoundMedia:
-    source: str
-    media_id: int
-    download_url: str
-    duration: int | None = None
-
-
-@dataclass
 class ChunkResult:
     chunk_index: int
     chunk_text: str
     search_prompt: str | None = None
     audio_path: Path | None = None
     audio_duration: float | None = None
+    visual_brief: VisualBrief | None = None
 
 
 @dataclass
@@ -112,13 +132,20 @@ class MediaTask:
     audio_duration: float | None
     video_path: Path
     raw_video_path: Path
+    visual_brief: VisualBrief | None = None
 
 
 class MediaRegistry:
-    """Потокобезопасный реестр использованных медиа для защиты от дубликатов."""
+    """Реестр использованных медиа: клипы не повторяются ни внутри прогона, ни между прогонами.
 
-    def __init__(self) -> None:
-        self.used_ids: set[str] = set()
+    Захват (`try_claim`) held только в памяти — иначе неудачное скачивание навсегда
+    забанило бы годный клип. На диск запись уходит в `commit()`, то есть после того,
+    как пара audio+video реально собрана.
+    """
+
+    def __init__(self, store: UsedMediaStore | None = None) -> None:
+        self.store = store
+        self.used_ids: set[str] = set(store.keys()) if store else set()
         self._lock = asyncio.Lock()
 
     def _passes_filters(
@@ -150,6 +177,21 @@ class MediaRegistry:
             return False
         return True
 
+    async def is_available(
+        self,
+        source: str,
+        media_id: int | None,
+        duration: int | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        min_duration: float | None = None,
+    ) -> bool:
+        """Проходит ли элемент фильтры — без захвата. Нужно для сбора пула кандидатов."""
+        async with self._lock:
+            return self._passes_filters(
+                source, media_id, duration, width, height, min_duration
+            )
+
     async def try_claim(
         self,
         source: str,
@@ -171,6 +213,13 @@ class MediaRegistry:
         async with self._lock:
             self.used_ids.discard(make_media_key(source, media_id))
 
+    async def commit(self, source: str, media_id: int, **meta) -> None:
+        """Фиксирует клип на диске после успешной сборки пары audio+video."""
+        if self.store is None:
+            return
+        key = make_media_key(source, media_id)
+        await asyncio.to_thread(self.store.remember, key, **meta)
+
 
 # ---------------------------------------------------------------------------
 # Загрузка настроек
@@ -190,6 +239,8 @@ def load_settings() -> None:
     global TTS_SERVER_TIMEOUT, SCRIPT_CHUNK_MAX_CHARS, FAILED_CHUNKS_LOG
     global STRESS_VERIFY_ENABLED, STRESS_AUTOCORRECT_ENABLED
     global STRESS_MISMATCH_LOG, STRESS_EXCEPTION_DICT, STRESS_VERIFY_ENGINE
+    global MEDIA_SEMANTIC_ENABLED, MEDIA_CANDIDATE_POOL, MEDIA_RANKER
+    global MEDIA_EMBEDDING_MODEL, USED_MEDIA_STORE, MEDIA_SELECTION_LOG
 
     load_dotenv()
 
@@ -217,10 +268,23 @@ def load_settings() -> None:
     except ImportError:
         pass
 
+    MEDIA_SEMANTIC_ENABLED = _env_bool("MEDIA_SEMANTIC_ENABLED", MEDIA_SEMANTIC_ENABLED)
+    MEDIA_CANDIDATE_POOL = int(
+        os.getenv("MEDIA_CANDIDATE_POOL", str(MEDIA_CANDIDATE_POOL))
+    )
+    MEDIA_RANKER = os.getenv("MEDIA_RANKER", MEDIA_RANKER).strip().lower()
+    MEDIA_EMBEDDING_MODEL = os.getenv("MEDIA_EMBEDDING_MODEL", MEDIA_EMBEDDING_MODEL).strip()
+    USED_MEDIA_STORE = os.getenv("USED_MEDIA_STORE", USED_MEDIA_STORE).strip()
+    MEDIA_SELECTION_LOG = os.getenv("MEDIA_SELECTION_LOG", MEDIA_SELECTION_LOG).strip()
+
     if MEDIA_TYPE not in ("video", "photo"):
         raise ValueError("MEDIA_TYPE должен быть 'video' или 'photo'")
     if ORIENTATION not in ("portrait", "landscape", "square"):
         raise ValueError("ORIENTATION должен быть 'portrait', 'landscape' или 'square'")
+    if MEDIA_RANKER not in ("llm", "embedding", "lexical"):
+        raise ValueError("MEDIA_RANKER должен быть 'llm', 'embedding' или 'lexical'")
+    if MEDIA_CANDIDATE_POOL < 1:
+        raise ValueError("MEDIA_CANDIDATE_POOL должен быть >= 1")
 
 
 def get_file_extension() -> str:
@@ -528,6 +592,111 @@ def generate_search_prompt_for_chunk(chunk: str, client: genai.Client) -> str | 
     return parse_gemini_response(raw_text)
 
 
+def _generate_visual_brief_sync(chunk: str, client: genai.Client) -> VisualBrief | None:
+    """Визуальное описание сцены: что должно быть в кадре, чтобы смысл читался без слов."""
+    prompt = f"{build_visual_brief_prompt()}\n\nТекст сцены:\n{chunk}"
+    response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    return parse_visual_brief(response.text or "")
+
+
+async def generate_visual_brief_for_chunk(
+    chunk: str, client: genai.Client
+) -> VisualBrief | None:
+    return await asyncio.to_thread(_generate_visual_brief_sync, chunk, client)
+
+
+def _rank_candidates_with_llm_sync(
+    brief: VisualBrief,
+    candidates: list[MediaCandidate],
+    client: genai.Client,
+) -> int | None:
+    """Просит модель выбрать кандидата по смыслу. Возвращает 0-based индекс."""
+    prompt = build_ranking_prompt(brief, candidates)
+    response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    return parse_ranking_choice(response.text or "", len(candidates))
+
+
+async def rank_candidates(
+    brief: VisualBrief,
+    candidates: list[MediaCandidate],
+    client: genai.Client,
+) -> SelectionOutcome:
+    """Упорядочивает кандидатов по смысловому соответствию описанию сцены.
+
+    Порядок важен: если верхний кандидат уже занят параллельным чанком,
+    вызывающая сторона идёт по списку дальше.
+    """
+    if not candidates:
+        return SelectionOutcome(chosen=None, ranker=MEDIA_RANKER, pool=[], reason="пустой пул")
+
+    if MEDIA_RANKER == "embedding":
+        try:
+            ranker = await asyncio.to_thread(EmbeddingRanker.get, MEDIA_EMBEDDING_MODEL)
+            ordered = await asyncio.to_thread(ranker.rank, brief, candidates)
+            return SelectionOutcome(
+                chosen=ordered[0],
+                ranker="embedding",
+                pool=ordered,
+                reason=f"косинусная близость {ordered[0].score}",
+            )
+        except ImportError:
+            print("  ⚠ sentence-transformers не установлен → лексическое ранжирование")
+        except Exception as error:
+            print(f"  ⚠ Ошибка эмбеддингов ({error}) → лексическое ранжирование")
+        ordered = rank_lexically(brief, candidates)
+        return SelectionOutcome(
+            chosen=ordered[0],
+            ranker="lexical",
+            pool=ordered,
+            reason=f"лексическое совпадение {ordered[0].score}",
+            fallback_used=True,
+        )
+
+    # Лексический скор считаем всегда: он задаёт порядок «второго выбора»
+    # и попадает в лог как объективная метрика рядом с решением модели.
+    ordered = rank_lexically(brief, candidates)
+
+    if MEDIA_RANKER == "lexical":
+        return SelectionOutcome(
+            chosen=ordered[0],
+            ranker="lexical",
+            pool=ordered,
+            reason=f"лексическое совпадение {ordered[0].score}",
+        )
+
+    try:
+        choice = await asyncio.to_thread(
+            _rank_candidates_with_llm_sync, brief, ordered, client
+        )
+    except Exception as error:
+        print(f"  ⚠ Ошибка LLM-ранжирования ({error}) → лексическое")
+        return SelectionOutcome(
+            chosen=ordered[0],
+            ranker="lexical",
+            pool=ordered,
+            reason=f"лексическое совпадение {ordered[0].score}",
+            fallback_used=True,
+        )
+
+    if choice is None:
+        return SelectionOutcome(
+            chosen=ordered[0],
+            ranker="lexical",
+            pool=ordered,
+            reason="модель не вернула номер → лексическое",
+            fallback_used=True,
+        )
+
+    picked = ordered.pop(choice)
+    ordered.insert(0, picked)
+    return SelectionOutcome(
+        chosen=picked,
+        ranker="llm",
+        pool=ordered,
+        reason=f"выбор модели, лексический скор {picked.score}",
+    )
+
+
 def build_gemini_tts_system_prompt() -> str:
     """Системный промпт для фонетической подготовки и режиссуры пауз перед Chatterbox TTS.
 
@@ -783,11 +952,26 @@ async def process_chunk(
     log_info("Script fragment", preview)
 
     search_prompt: str | None = None
+    visual_brief: VisualBrief | None = None
     async with gemini_semaphore:
         try:
-            search_prompt = await asyncio.to_thread(
-                generate_search_prompt_for_chunk, script_fragment, client
-            )
+            if MEDIA_SEMANTIC_ENABLED:
+                visual_brief = await generate_visual_brief_for_chunk(
+                    script_fragment, client
+                )
+                if visual_brief is None:
+                    print(
+                        "  ⚠ Визуальное описание не разобрано "
+                        "→ откат на подбор по ключевым словам"
+                    )
+                else:
+                    search_prompt = visual_brief.query
+                    log_info("Visual", visual_brief.visual)
+
+            if not search_prompt:
+                search_prompt = await asyncio.to_thread(
+                    generate_search_prompt_for_chunk, script_fragment, client
+                )
             if not search_prompt:
                 print("  ⚠ Gemini не вернула промпт, пропуск чанка.")
                 return ChunkResult(index, script_fragment)
@@ -800,7 +984,12 @@ async def process_chunk(
             return ChunkResult(index, script_fragment)
 
     if MEDIA_TYPE != "video":
-        return ChunkResult(index, script_fragment, search_prompt=search_prompt)
+        return ChunkResult(
+            index,
+            script_fragment,
+            search_prompt=search_prompt,
+            visual_brief=visual_brief,
+        )
 
     final_audio_path = build_audio_path(index, output_dir)
     processed_text: str | None = None
@@ -909,6 +1098,7 @@ async def process_chunk(
             search_prompt=search_prompt,
             audio_path=final_audio_path,
             audio_duration=audio_duration,
+            visual_brief=visual_brief,
         )
     except Exception as error:
         print(f"  ⚠ Ошибка ffprobe: {error}")
@@ -981,6 +1171,7 @@ def build_media_tasks(chunk_results: list[ChunkResult], output_dir: Path) -> lis
                 audio_duration=chunk_result.audio_duration,
                 video_path=build_video_path(index, output_dir),
                 raw_video_path=build_raw_video_path(index, output_dir),
+                visual_brief=chunk_result.visual_brief,
             )
         )
 
@@ -1091,54 +1282,53 @@ async def fetch_pexels_page(
     return items, has_next_page
 
 
-async def select_pexels_item(
-    items: list[dict],
-    registry: MediaRegistry,
-    min_duration: float | None = None,
-) -> dict | None:
-    for item in items:
-        url, duration, width, height = get_pexels_download_info(item)
-        if url is None:
-            continue
-        if await registry.try_claim(
-            source="pexels",
-            media_id=item.get("id"),
-            duration=duration,
-            width=width,
-            height=height,
-            min_duration=min_duration,
-        ):
-            return item
-    return None
-
-
-async def search_pexels_media(
+async def collect_pexels_candidates(
     session: aiohttp.ClientSession,
     query: str,
     api_key: str,
     registry: MediaRegistry,
     min_duration: float | None = None,
-) -> FoundMedia | None:
+    pool_size: int = 1,
+) -> list[MediaCandidate]:
+    """Собирает до pool_size свободных кандидатов Pexels вместе с их подписями."""
+    pool: list[MediaCandidate] = []
+
     for page in range(1, MAX_SEARCH_PAGES + 1):
         items, has_next_page = await fetch_pexels_page(session, query, api_key, page)
         if not items:
-            return None
+            break
 
-        selected = await select_pexels_item(items, registry, min_duration)
-        if selected is not None:
-            url, duration, _, _ = get_pexels_download_info(selected)
-            if url:
-                return FoundMedia(
+        for item in items:
+            url, duration, width, height = get_pexels_download_info(item)
+            if url is None:
+                continue
+            if not await registry.is_available(
+                source="pexels",
+                media_id=item.get("id"),
+                duration=duration,
+                width=width,
+                height=height,
+                min_duration=min_duration,
+            ):
+                continue
+            pool.append(
+                MediaCandidate(
                     source="pexels",
-                    media_id=selected["id"],
+                    media_id=item["id"],
                     download_url=url,
                     duration=duration,
+                    width=width,
+                    height=height,
+                    caption=extract_caption(item, "pexels"),
                 )
-            await registry.release("pexels", selected["id"])
+            )
+            if len(pool) >= pool_size:
+                return pool
 
         if not has_next_page:
             break
-    return None
+
+    return pool
 
 
 # ---------------------------------------------------------------------------
@@ -1177,53 +1367,53 @@ async def fetch_pixabay_page(
     return hits, has_next_page
 
 
-async def select_pixabay_item(
-    items: list[dict],
-    registry: MediaRegistry,
-    min_duration: float | None = None,
-) -> dict | None:
-    for item in items:
-        url, duration, width, height = get_pixabay_download_info(item)
-        if url is None:
-            continue
-        if await registry.try_claim(
-            source="pixabay",
-            media_id=item.get("id"),
-            duration=duration,
-            width=width,
-            height=height,
-            min_duration=min_duration,
-        ):
-            return item
-    return None
-
-
-async def search_pixabay_media(
+async def collect_pixabay_candidates(
     session: aiohttp.ClientSession,
     query: str,
     api_key: str,
     registry: MediaRegistry,
     min_duration: float | None = None,
-) -> FoundMedia | None:
+    pool_size: int = 1,
+) -> list[MediaCandidate]:
+    """Собирает до pool_size свободных кандидатов Pixabay вместе с их tags."""
+    pool: list[MediaCandidate] = []
+
     for page in range(1, MAX_SEARCH_PAGES + 1):
         items, has_next_page = await fetch_pixabay_page(session, query, api_key, page)
         if not items:
-            return None
+            break
 
-        selected = await select_pixabay_item(items, registry, min_duration)
-        if selected is not None:
-            url, duration, _, _ = get_pixabay_download_info(selected)
-            if url:
-                return FoundMedia(
+        for item in items:
+            url, duration, width, height = get_pixabay_download_info(item)
+            if url is None:
+                continue
+            if not await registry.is_available(
+                source="pixabay",
+                media_id=item.get("id"),
+                duration=duration,
+                width=width,
+                height=height,
+                min_duration=min_duration,
+            ):
+                continue
+            pool.append(
+                MediaCandidate(
                     source="pixabay",
-                    media_id=selected["id"],
+                    media_id=item["id"],
                     download_url=url,
                     duration=duration,
+                    width=width,
+                    height=height,
+                    caption=extract_caption(item, "pixabay"),
                 )
+            )
+            if len(pool) >= pool_size:
+                return pool
 
         if not has_next_page:
             break
-    return None
+
+    return pool
 
 
 # ---------------------------------------------------------------------------
@@ -1231,33 +1421,68 @@ async def search_pixabay_media(
 # ---------------------------------------------------------------------------
 
 
-async def search_media_with_fallback(
+async def collect_candidates_with_fallback(
     session: aiohttp.ClientSession,
     query: str,
     pexels_api_key: str,
     pixabay_api_key: str,
     registry: MediaRegistry,
     min_duration: float | None = None,
-) -> FoundMedia | None:
-    """Ищет медиа на Pexels, при отсутствии результатов — на Pixabay."""
+    pool_size: int = 1,
+) -> list[MediaCandidate]:
+    """Набирает пул кандидатов на Pexels, при недоборе дополняет Pixabay."""
     media_label = "фото" if MEDIA_TYPE == "photo" else "видео"
     print(f"  → Поиск на Pexels ({media_label}): {query!r}")
 
-    found = await search_pexels_media(
-        session, query, pexels_api_key, registry, min_duration
+    pool = await collect_pexels_candidates(
+        session, query, pexels_api_key, registry, min_duration, pool_size
     )
-    if found is not None:
-        return found
+    if len(pool) >= pool_size:
+        return pool
 
-    print("  ↳ Pexels: 0 подходящих результатов → переключаюсь на Pixabay")
     if not pixabay_api_key:
-        print("  ⚠ PIXABAY_API_KEY не задан, fallback невозможен.")
-        return None
+        if not pool:
+            print("  ⚠ PIXABAY_API_KEY не задан, fallback невозможен.")
+        return pool
 
-    print(f"  → Поиск на Pixabay ({media_label}): {query!r}")
-    return await search_pixabay_media(
-        session, query, pixabay_api_key, registry, min_duration
+    print(
+        f"  ↳ Pexels: {len(pool)} из {pool_size} кандидатов "
+        f"→ дополняю с Pixabay: {query!r}"
     )
+    pool.extend(
+        await collect_pixabay_candidates(
+            session,
+            query,
+            pixabay_api_key,
+            registry,
+            min_duration,
+            pool_size - len(pool),
+        )
+    )
+    return pool
+
+
+async def claim_candidate(
+    pool: list[MediaCandidate],
+    registry: MediaRegistry,
+    min_duration: float | None = None,
+) -> MediaCandidate | None:
+    """Захватывает первого доступного кандидата в порядке ранжирования.
+
+    Порядок обхода нужен потому, что параллельный чанк мог занять верхний
+    кандидат между сбором пула и захватом.
+    """
+    for candidate in pool:
+        if await registry.try_claim(
+            source=candidate.source,
+            media_id=candidate.media_id,
+            duration=candidate.duration,
+            width=candidate.width,
+            height=candidate.height,
+            min_duration=min_duration,
+        ):
+            return candidate
+    return None
 
 
 async def download_file(
@@ -1298,11 +1523,15 @@ async def process_video_task(
     pixabay_api_key: str,
     registry: MediaRegistry,
     semaphore: asyncio.Semaphore,
+    gemini_client: genai.Client | None = None,
+    selection_log: MediaSelectionLog | None = None,
 ) -> bool:
     """Скачивает видео, обрезает под длительность аудио и сохраняет пару файлов."""
     async with semaphore:
         log_section(f"CHUNK {task.index}/{total}")
         log_info("Search query", task.prompt)
+        if task.visual_brief is not None:
+            log_info("Visual", task.visual_brief.visual)
 
         audio_duration = await resolve_audio_duration(task.audio_path)
         if audio_duration is None:
@@ -1316,21 +1545,65 @@ async def process_video_task(
         trim_duration = get_trim_duration(audio_duration)
         log_info("Trim target", f"{trim_duration:.2f} s (+{VIDEO_TRIM_PADDING} s padding)")
 
-        found = await search_media_with_fallback(
+        use_ranking = (
+            MEDIA_SEMANTIC_ENABLED
+            and task.visual_brief is not None
+            and gemini_client is not None
+        )
+        pool_size = MEDIA_CANDIDATE_POOL if use_ranking else 1
+
+        pool = await collect_candidates_with_fallback(
             session,
             task.prompt,
             pexels_api_key,
             pixabay_api_key,
             registry,
             min_duration=trim_duration,
+            pool_size=pool_size,
         )
-        if found is None:
+        if not pool:
             print(f"  ✗ Видео не найдено ({format_not_found_message(trim_duration)}).")
+            if selection_log is not None:
+                selection_log.write(
+                    chunk_index=task.index,
+                    brief=task.visual_brief,
+                    outcome=SelectionOutcome(
+                        chosen=None,
+                        ranker="none",
+                        reason="кандидатов не найдено",
+                    ),
+                    chunk_text=task.chunk_text,
+                )
             return False
 
+        if use_ranking:
+            log_info("Candidates", str(len(pool)))
+            outcome = await rank_candidates(task.visual_brief, pool, gemini_client)
+        else:
+            outcome = SelectionOutcome(
+                chosen=pool[0], ranker="none", pool=pool, reason="ранжирование отключено"
+            )
+
+        found = await claim_candidate(outcome.pool, registry, trim_duration)
+        if found is None:
+            print("  ✗ Все кандидаты заняты параллельными сценами.")
+            outcome.chosen = None
+            outcome.reason = "все кандидаты заняты"
+            if selection_log is not None:
+                selection_log.write(
+                    chunk_index=task.index,
+                    brief=task.visual_brief,
+                    outcome=outcome,
+                    chunk_text=task.chunk_text,
+                )
+            return False
+
+        outcome.chosen = found
         source_label = found.source.capitalize()
         log_info("Source", source_label)
         log_info("Media ID", str(found.media_id))
+        log_info("Caption", found.caption or "—")
+        log_info("Match", f"{outcome.ranker}, {outcome.reason}")
         if found.duration is not None:
             log_info("Stock duration", f"{found.duration} s")
 
@@ -1350,6 +1623,24 @@ async def process_video_task(
             return False
 
         task.raw_video_path.unlink(missing_ok=True)
+
+        await registry.commit(
+            found.source,
+            found.media_id,
+            query=task.prompt,
+            visual=task.visual_brief.visual if task.visual_brief else None,
+            caption=found.caption or None,
+            score=found.score,
+            ranker=outcome.ranker,
+        )
+        if selection_log is not None:
+            selection_log.write(
+                chunk_index=task.index,
+                brief=task.visual_brief,
+                outcome=outcome,
+                chunk_text=task.chunk_text,
+            )
+
         print(
             f"  ✓ Готово ({source_label}): {task.audio_path.name} + {task.video_path.name}"
         )
@@ -1372,13 +1663,15 @@ async def process_photo_prompt(
         log_section(f"PROMPT {index}/{total}")
         log_info("Query", prompt)
 
-        found = await search_media_with_fallback(
+        pool = await collect_candidates_with_fallback(
             session,
             prompt,
             pexels_api_key,
             pixabay_api_key,
             registry,
+            pool_size=1,
         )
+        found = await claim_candidate(pool, registry)
         if found is None:
             print(f"  ✗ Медиа не найдено ({format_not_found_message()}).")
             return False
@@ -1392,6 +1685,7 @@ async def process_photo_prompt(
             await registry.release(found.source, found.media_id)
             return False
 
+        await registry.commit(found.source, found.media_id, query=prompt)
         print(f"  ✓ Готово ({source_label}): {output_path.name}")
         return True
 
@@ -1402,6 +1696,8 @@ async def process_all_media(
     pixabay_api_key: str,
     output_dir: Path,
     registry: MediaRegistry,
+    gemini_client: genai.Client | None = None,
+    selection_log: MediaSelectionLog | None = None,
 ) -> int:
     """Параллельно обрабатывает все задачи скачивания."""
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
@@ -1422,6 +1718,8 @@ async def process_all_media(
                     pixabay_api_key,
                     registry,
                     semaphore,
+                    gemini_client,
+                    selection_log,
                 )
                 for task in tasks_list
             ]
@@ -1468,6 +1766,7 @@ async def async_main() -> int:
         print(f"Ошибка настроек: {error}")
         return 1
 
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     gemini_api_key = os.getenv("GEMINI_API_KEY")
     pexels_api_key = os.getenv("PEXELS_API_KEY")
     pixabay_api_key = os.getenv("PIXABAY_API_KEY", "")
@@ -1573,7 +1872,9 @@ async def async_main() -> int:
     save_prompts([chunk.search_prompt for chunk in ready_chunks])
     print(f"\n  ✓ Сохранено {len(ready_chunks)} промптов в {PROMPTS_FILE}")
 
-    registry = MediaRegistry()
+    used_media_store = UsedMediaStore(USED_MEDIA_STORE)
+    registry = MediaRegistry(store=used_media_store)
+    selection_log = MediaSelectionLog(MEDIA_SELECTION_LOG, run_id)
 
     download_label = "СКАЧИВАНИЕ ФОТО" if MEDIA_TYPE == "photo" else "СКАЧИВАНИЕ И СИНХРОНИЗАЦИЯ ВИДЕО"
     log_section(download_label)
@@ -1583,6 +1884,15 @@ async def async_main() -> int:
     log_info("Output dir", str(output_dir.resolve()))
     log_info("Chunks ready", str(len(ready_chunks)))
     log_info("Concurrency", str(MAX_CONCURRENT_REQUESTS))
+    log_info("Semantic match", "on" if MEDIA_SEMANTIC_ENABLED else "off")
+    if MEDIA_SEMANTIC_ENABLED:
+        log_info("Ranker", MEDIA_RANKER)
+        log_info("Candidate pool", str(MEDIA_CANDIDATE_POOL))
+    log_info(
+        "Used media store",
+        f"{USED_MEDIA_STORE} ({len(used_media_store)} клипов из прошлых прогонов)",
+    )
+    log_info("Selection log", MEDIA_SELECTION_LOG)
 
     success_count = await process_all_media(
         chunk_results,
@@ -1590,6 +1900,8 @@ async def async_main() -> int:
         pixabay_api_key,
         output_dir,
         registry,
+        client,
+        selection_log,
     )
 
     log_section("ИТОГ")

@@ -18,5 +18,10 @@ debug/logs/*
 # Боевой лог ударений — версионируем
 !stress_mismatches.log
 
+# Реестр использованных клипов и лог подбора видеоряда: локальная история прогонов,
+# у каждой машины своя — в репозиторий не идёт.
+used_media.json
+media_selection.log
+
 # Кэш конвертации U+0301 → '+' для StressRNN (генерируется из exception_dictionary.txt)
 *.stressrnn.txt
