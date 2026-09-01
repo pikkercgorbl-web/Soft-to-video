@@ -90,6 +90,7 @@ class SelectionOutcome:
     pool: list[MediaCandidate] = field(default_factory=list)
     reason: str = ""
     fallback_used: bool = False
+    raw_llm_response: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +198,14 @@ def build_ranking_prompt(brief: VisualBrief, candidates: list[MediaCandidate]) -
         f"Визуальное описание сцены: {brief.visual}\n"
         f"Кандидаты:\n{listing}\n\n"
         "Выбери номер клипа, который лучше всего передаёт этот визуал по смыслу, "
-        "игнорируя эстетику. Ответ — только номер."
+        "игнорируя эстетику. Если в описании сцены указано конкретное количество "
+        "людей и их пол (например, «один мужчина», «двое мужчин», «женщина») — "
+        "это обязательное условие: кандидат с другим количеством или полом людей "
+        "не подходит, даже если он лучше совпадает по прочим деталям (место, "
+        "действие, обстановка). Среди подходящих по числу/полу людей выбирай "
+        "лучший по остальному смыслу. Если ни один кандидат не совпадает по "
+        "числу/полу людей, выбирай лучший по остальным признакам. "
+        "Ответ — только номер."
     )
 
 
@@ -239,11 +247,33 @@ def parse_visual_brief(raw_text: str) -> VisualBrief | None:
 
 
 def parse_ranking_choice(raw_text: str, pool_size: int) -> int | None:
-    """Возвращает 0-based индекс выбранного кандидата."""
-    match = re.search(r"\d+", raw_text or "")
-    if not match:
+    """Возвращает 0-based индекс выбранного кандидата.
+
+    Модель почти всегда отвечает голым числом, как просят в промпте, но
+    иногда всё же присылает развёрнутое рассуждение с перечислением
+    кандидатов (там встречаются номера вроде "1.", "2." — это не ответ,
+    а нумерация пунктов). Чтобы не зацепить такой номер по ошибке:
+    1. сначала ищем число на последней непустой строке — там обычно и
+       стоит финальный ответ, когда модель рассуждает перед ним;
+    2. если строка не подошла — берём ПОСЛЕДНЕЕ число во всём тексте
+       (а не первое: первое почти наверняка часть перечисления).
+    """
+    text = (raw_text or "").strip()
+    if not text:
         return None
-    number = int(match.group(0))
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines:
+        last_line_match = re.fullmatch(r"\D*(\d+)\D*", lines[-1])
+        if last_line_match:
+            number = int(last_line_match.group(1))
+            if 1 <= number <= pool_size:
+                return number - 1
+
+    all_matches = re.findall(r"\d+", text)
+    if not all_matches:
+        return None
+    number = int(all_matches[-1])
     if 1 <= number <= pool_size:
         return number - 1
     return None
@@ -444,6 +474,7 @@ class MediaSelectionLog:
             "fallback_used": outcome.fallback_used,
             "pool_size": len(outcome.pool),
             "reason": outcome.reason,
+            "raw_llm_response": outcome.raw_llm_response,
             "chosen": (
                 {
                     "source": chosen.source,

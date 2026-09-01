@@ -609,11 +609,17 @@ def _rank_candidates_with_llm_sync(
     brief: VisualBrief,
     candidates: list[MediaCandidate],
     client: genai.Client,
-) -> int | None:
-    """Просит модель выбрать кандидата по смыслу. Возвращает 0-based индекс."""
+) -> tuple[int | None, str]:
+    """Просит модель выбрать кандидата по смыслу.
+
+    Возвращает (0-based индекс или None, сырой текст ответа) — сырой текст
+    нужен в логе, чтобы отличить реальный (пусть и неудачный) выбор модели
+    от сбоя парсинга её ответа.
+    """
     prompt = build_ranking_prompt(brief, candidates)
     response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-    return parse_ranking_choice(response.text or "", len(candidates))
+    raw_text = response.text or ""
+    return parse_ranking_choice(raw_text, len(candidates)), raw_text
 
 
 async def rank_candidates(
@@ -665,7 +671,7 @@ async def rank_candidates(
         )
 
     try:
-        choice = await asyncio.to_thread(
+        choice, raw_response = await asyncio.to_thread(
             _rank_candidates_with_llm_sync, brief, ordered, client
         )
     except Exception as error:
@@ -676,6 +682,7 @@ async def rank_candidates(
             pool=ordered,
             reason=f"лексическое совпадение {ordered[0].score}",
             fallback_used=True,
+            raw_llm_response=None,
         )
 
     if choice is None:
@@ -685,6 +692,7 @@ async def rank_candidates(
             pool=ordered,
             reason="модель не вернула номер → лексическое",
             fallback_used=True,
+            raw_llm_response=raw_response,
         )
 
     picked = ordered.pop(choice)
@@ -694,6 +702,7 @@ async def rank_candidates(
         ranker="llm",
         pool=ordered,
         reason=f"выбор модели, лексический скор {picked.score}",
+        raw_llm_response=raw_response,
     )
 
 
