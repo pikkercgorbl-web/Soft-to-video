@@ -36,6 +36,7 @@ class WordStats:
     mismatch: int = 0
     filled: int = 0
     missed_homograph: int = 0
+    missed_unmarked: int = 0
     gemini_idx: int | None = None
     dict_idx: int | None = None
     last_event: str = ""
@@ -65,7 +66,7 @@ def load_summary(log_path: Path, days: int) -> Summary:
         if not match:
             continue
         event = match.group("event")
-        if event not in ("auto_corrected", "mismatch", "gemini_missed_filled", "gemini_missed_homograph"):
+        if event not in ("auto_corrected", "mismatch", "gemini_missed_filled", "gemini_missed_homograph", "gemini_missed_unmarked"):
             continue
 
         ts = parse_ts(match.group("ts"))
@@ -88,6 +89,8 @@ def load_summary(log_path: Path, days: int) -> Summary:
             stats.filled += 1
         elif event == "gemini_missed_homograph":
             stats.missed_homograph += 1
+        elif event == "gemini_missed_unmarked":
+            stats.missed_unmarked += 1
         else:
             stats.mismatch += 1
         summary.total_lines += 1
@@ -136,10 +139,11 @@ def print_report(log_path: Path, days: int, min_candidate: int) -> None:
     total_fill = sum(s.filled for s in summary.by_word.values())
     total_mm = sum(s.mismatch for s in summary.by_word.values())
     total_mh = sum(s.missed_homograph for s in summary.by_word.values())
+    total_mu = sum(s.missed_unmarked for s in summary.by_word.values())
     print("-" * 82)
     print(
         f"Итого filled: {total_fill}  auto_corrected: {total_ac}  "
-        f"mismatch: {total_mm}  missed_homograph: {total_mh}"
+        f"mismatch: {total_mm}  missed_homograph: {total_mh}  missed_unmarked: {total_mu}"
     )
     print()
 

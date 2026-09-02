@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import warnings
 from dataclasses import dataclass
@@ -42,40 +43,71 @@ from media_semantic import (
     parse_visual_brief,
     rank_lexically,
 )
+from tts_text_sanitize import sanitize_tts_text
 
 # ==========================================
 # 🎛️ НАСТРОЙКИ ГОЛОСА CHATTERBOX
 # ==========================================
-TTS_VOICE_FILE = "ya.wav"      # Имя файла голоса (твоего клона или системного пресета)
+TTS_VOICE_FILE = "1_.wav"      # Имя файла голоса (твоего клона или системного пресета)
 TTS_VOICE_MODE = "clone"       # Режим: "clone" (твои голоса) или "predefined" (системные)
 TTS_LANGUAGE = "ru"            # Язык
 TTS_SPEED_FACTOR = 1.0         # Скорость
-TTS_TEMPERATURE = 0.8          # Креативность
-TTS_EXAGGERATION = 1.3         # Эмоциональность
+TTS_TEMPERATURE = 0.7          # Креативность (ниже = стабильнее, меньше «съедания» слов)
+TTS_EXAGGERATION = 1.0         # Эмоциональность (выше 1.2 — модель начинает частить и глотать слоги)
 TTS_CFG_WEIGHT = 0.5           # Строгость следования тексту
+TTS_CHUNK_SIZE = 100           # Размер sub-chunk на сервере Chatterbox (split_text)
+# ==========================================
+
+# ==========================================
+# 🔇 ЧИСТКА ПАУЗ В ОЗВУЧКЕ
+# ==========================================
+AUDIO_PAUSE_CLEAN = True       # глушить придыхания/шорохи на стыках sub-chunk'ов
+AUDIO_PAUSE_ENTER_DB = -36.0   # ниже = консервативнее, лучше сохраняет тихую речь
+AUDIO_PAUSE_EXIT_DB = -48.0    # порог выхода из речи (гистерезис)
+AUDIO_PAUSE_MIN_MS = 180.0     # короткие провалы внутри слов не трогаем
+AUDIO_PAUSE_GUARD_MS = 80.0    # большой запас у границ речи
+AUDIO_PAUSE_BRIDGE_MAX_MS = 0.0     # опасное склеивание выключено: оно съедало тихие слова
+AUDIO_PAUSE_BRIDGE_PEAK_DB = -20.0  # пик моста (отн. пика файла), ниже — глушим
+AUDIO_PAUSE_TAIL_EXTEND_MS = 0.0    # опасное продление выключено
+AUDIO_PAUSE_TAIL_PEAK_DB = -18.0    # порог «тихого хвоста» для продления
+AUDIO_STITCH_CLEAN = True       # мягко гасить хвост перед точной тишиной склейки
+AUDIO_STITCH_MIN_ZERO_MS = 100.0
+AUDIO_STITCH_FADE_BEFORE_MS = 40.0
+AUDIO_VAD_CLEAN = True          # WebRTC VAD: ветер/шорох/вой против человеческой речи
+AUDIO_VAD_AGGRESSIVENESS = 3    # 0..3; 3 строже всего отбрасывает не-речь
+AUDIO_VAD_SPEECH_PAD_MS = 180.0 # защищать речь на 180 ms с обеих сторон
+AUDIO_VAD_MIN_NONSPEECH_MS = 120.0
+AUDIO_SPECTRAL_CLEAN = False    # глобально опасен для шипящих; применяется только у стыков
+AUDIO_SPECTRAL_MIN_REGION_MS = 220.0  # короче — может быть обычная шипящая согласная
+AUDIO_SPECTRAL_MAX_GAP_MS = 80.0
+AUDIO_KEEP_RAW = True          # сохранять оригинал до обработки в downloads/raw
+# Переопределение через .env: AUDIO_PAUSE_CLEAN, AUDIO_PAUSE_ENTER_DB, ...
 # ==========================================
 
 # ==========================================
 # 🎬 СМЫСЛОВОЙ ПОДБОР ВИДЕОРЯДА
 # ==========================================
 MEDIA_SEMANTIC_ENABLED = True          # визуальное описание сцены + ранжирование кандидатов
+MEDIA_DOWNLOAD_ENABLED = True          # скачивание и синхронизация видеоряда (Pexels/Pixabay)
 MEDIA_CANDIDATE_POOL = 10              # сколько кандидатов собирать на ранжирование
 MEDIA_RANKER = "llm"                   # llm | embedding | lexical
 MEDIA_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 USED_MEDIA_STORE = "used_media.json"   # персистентный реестр использованных клипов
 MEDIA_SELECTION_LOG = "media_selection.log"
-# Переопределение через .env: MEDIA_SEMANTIC_ENABLED, MEDIA_CANDIDATE_POOL, MEDIA_RANKER
+# Переопределение через .env: MEDIA_DOWNLOAD_ENABLED, MEDIA_SEMANTIC_ENABLED, ...
 # ==========================================
 
 # ==========================================
 # 🔍 ПРОВЕРКА УДАРЕНИЙ (StressRNN, локально)
 # ==========================================
 STRESS_VERIFY_ENABLED = True          # логировать расхождения (и омографы)
-STRESS_AUTOCORRECT_ENABLED = False    # подменять ударение словарём (кроме омографов)
+STRESS_AUTOCORRECT_ENABLED = True     # StressRNN исправляет ошибки Gemini (кроме омографов)
+STRESS_FILL_UNMARKED = False          # доразметка StressRNN для слов без U+0301 от Gemini
 STRESS_MISMATCH_LOG = "stress_mismatches.log"
 STRESS_EXCEPTION_DICT = "exception_dictionary.txt"  # U+0301, дополняет Зализняка
 STRESS_VERIFY_ENGINE = "stressrnn"    # stressrnn | russtress
-# Переопределение через .env: STRESS_VERIFY_ENABLED, STRESS_AUTOCORRECT_ENABLED
+# Переопределение через .env: STRESS_VERIFY_ENABLED, STRESS_AUTOCORRECT_ENABLED,
+# STRESS_FILL_UNMARKED
 # ==========================================
 
 # ---------------------------------------------------------------------------
@@ -237,9 +269,19 @@ def load_settings() -> None:
     """Загружает глобальные настройки из .env."""
     global MEDIA_TYPE, ORIENTATION, GLOBAL_VIBE, CHATTERBOX_TTS_URL
     global TTS_SERVER_TIMEOUT, SCRIPT_CHUNK_MAX_CHARS, FAILED_CHUNKS_LOG
-    global STRESS_VERIFY_ENABLED, STRESS_AUTOCORRECT_ENABLED
+    global TTS_SPEED_FACTOR, TTS_TEMPERATURE, TTS_EXAGGERATION, TTS_CFG_WEIGHT, TTS_CHUNK_SIZE
+    global AUDIO_PAUSE_CLEAN, AUDIO_PAUSE_ENTER_DB, AUDIO_PAUSE_EXIT_DB
+    global AUDIO_PAUSE_MIN_MS, AUDIO_PAUSE_GUARD_MS
+    global AUDIO_PAUSE_BRIDGE_MAX_MS, AUDIO_PAUSE_BRIDGE_PEAK_DB
+    global AUDIO_PAUSE_TAIL_EXTEND_MS, AUDIO_PAUSE_TAIL_PEAK_DB, AUDIO_KEEP_RAW
+    global AUDIO_STITCH_CLEAN, AUDIO_STITCH_MIN_ZERO_MS, AUDIO_STITCH_FADE_BEFORE_MS
+    global AUDIO_VAD_CLEAN, AUDIO_VAD_AGGRESSIVENESS
+    global AUDIO_VAD_SPEECH_PAD_MS, AUDIO_VAD_MIN_NONSPEECH_MS
+    global AUDIO_SPECTRAL_CLEAN, AUDIO_SPECTRAL_MIN_REGION_MS
+    global AUDIO_SPECTRAL_MAX_GAP_MS
+    global STRESS_VERIFY_ENABLED, STRESS_AUTOCORRECT_ENABLED, STRESS_FILL_UNMARKED
     global STRESS_MISMATCH_LOG, STRESS_EXCEPTION_DICT, STRESS_VERIFY_ENGINE
-    global MEDIA_SEMANTIC_ENABLED, MEDIA_CANDIDATE_POOL, MEDIA_RANKER
+    global MEDIA_SEMANTIC_ENABLED, MEDIA_DOWNLOAD_ENABLED, MEDIA_CANDIDATE_POOL, MEDIA_RANKER
     global MEDIA_EMBEDDING_MODEL, USED_MEDIA_STORE, MEDIA_SELECTION_LOG
 
     load_dotenv()
@@ -253,10 +295,65 @@ def load_settings() -> None:
         os.getenv("SCRIPT_CHUNK_MAX_CHARS", str(SCRIPT_CHUNK_MAX_CHARS))
     )
     FAILED_CHUNKS_LOG = os.getenv("FAILED_CHUNKS_LOG", FAILED_CHUNKS_LOG).strip()
+    TTS_SPEED_FACTOR = float(os.getenv("TTS_SPEED_FACTOR", str(TTS_SPEED_FACTOR)))
+    TTS_TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", str(TTS_TEMPERATURE)))
+    TTS_EXAGGERATION = float(os.getenv("TTS_EXAGGERATION", str(TTS_EXAGGERATION)))
+    TTS_CFG_WEIGHT = float(os.getenv("TTS_CFG_WEIGHT", str(TTS_CFG_WEIGHT)))
+    TTS_CHUNK_SIZE = int(os.getenv("TTS_CHUNK_SIZE", str(TTS_CHUNK_SIZE)))
+    if TTS_CHUNK_SIZE < 50:
+        raise ValueError("TTS_CHUNK_SIZE должен быть >= 50")
+
+    AUDIO_PAUSE_CLEAN = _env_bool("AUDIO_PAUSE_CLEAN", AUDIO_PAUSE_CLEAN)
+    AUDIO_PAUSE_ENTER_DB = float(os.getenv("AUDIO_PAUSE_ENTER_DB", str(AUDIO_PAUSE_ENTER_DB)))
+    AUDIO_PAUSE_EXIT_DB = float(os.getenv("AUDIO_PAUSE_EXIT_DB", str(AUDIO_PAUSE_EXIT_DB)))
+    AUDIO_PAUSE_MIN_MS = float(os.getenv("AUDIO_PAUSE_MIN_MS", str(AUDIO_PAUSE_MIN_MS)))
+    AUDIO_PAUSE_GUARD_MS = float(os.getenv("AUDIO_PAUSE_GUARD_MS", str(AUDIO_PAUSE_GUARD_MS)))
+    AUDIO_PAUSE_BRIDGE_MAX_MS = float(
+        os.getenv("AUDIO_PAUSE_BRIDGE_MAX_MS", str(AUDIO_PAUSE_BRIDGE_MAX_MS))
+    )
+    AUDIO_PAUSE_BRIDGE_PEAK_DB = float(
+        os.getenv("AUDIO_PAUSE_BRIDGE_PEAK_DB", str(AUDIO_PAUSE_BRIDGE_PEAK_DB))
+    )
+    AUDIO_PAUSE_TAIL_EXTEND_MS = float(
+        os.getenv("AUDIO_PAUSE_TAIL_EXTEND_MS", str(AUDIO_PAUSE_TAIL_EXTEND_MS))
+    )
+    AUDIO_PAUSE_TAIL_PEAK_DB = float(
+        os.getenv("AUDIO_PAUSE_TAIL_PEAK_DB", str(AUDIO_PAUSE_TAIL_PEAK_DB))
+    )
+    AUDIO_STITCH_CLEAN = _env_bool("AUDIO_STITCH_CLEAN", AUDIO_STITCH_CLEAN)
+    AUDIO_STITCH_MIN_ZERO_MS = float(
+        os.getenv("AUDIO_STITCH_MIN_ZERO_MS", str(AUDIO_STITCH_MIN_ZERO_MS))
+    )
+    AUDIO_STITCH_FADE_BEFORE_MS = float(
+        os.getenv("AUDIO_STITCH_FADE_BEFORE_MS", str(AUDIO_STITCH_FADE_BEFORE_MS))
+    )
+    AUDIO_VAD_CLEAN = _env_bool("AUDIO_VAD_CLEAN", AUDIO_VAD_CLEAN)
+    AUDIO_VAD_AGGRESSIVENESS = int(
+        os.getenv("AUDIO_VAD_AGGRESSIVENESS", str(AUDIO_VAD_AGGRESSIVENESS))
+    )
+    AUDIO_VAD_SPEECH_PAD_MS = float(
+        os.getenv("AUDIO_VAD_SPEECH_PAD_MS", str(AUDIO_VAD_SPEECH_PAD_MS))
+    )
+    AUDIO_VAD_MIN_NONSPEECH_MS = float(
+        os.getenv("AUDIO_VAD_MIN_NONSPEECH_MS", str(AUDIO_VAD_MIN_NONSPEECH_MS))
+    )
+    AUDIO_SPECTRAL_CLEAN = _env_bool("AUDIO_SPECTRAL_CLEAN", AUDIO_SPECTRAL_CLEAN)
+    AUDIO_SPECTRAL_MIN_REGION_MS = float(
+        os.getenv("AUDIO_SPECTRAL_MIN_REGION_MS", str(AUDIO_SPECTRAL_MIN_REGION_MS))
+    )
+    AUDIO_SPECTRAL_MAX_GAP_MS = float(
+        os.getenv("AUDIO_SPECTRAL_MAX_GAP_MS", str(AUDIO_SPECTRAL_MAX_GAP_MS))
+    )
+    if AUDIO_VAD_AGGRESSIVENESS not in (0, 1, 2, 3):
+        raise ValueError("AUDIO_VAD_AGGRESSIVENESS должен быть от 0 до 3")
+    AUDIO_KEEP_RAW = _env_bool("AUDIO_KEEP_RAW", AUDIO_KEEP_RAW)
+    if AUDIO_PAUSE_ENTER_DB < AUDIO_PAUSE_EXIT_DB:
+        raise ValueError("AUDIO_PAUSE_ENTER_DB должен быть выше AUDIO_PAUSE_EXIT_DB")
     STRESS_VERIFY_ENABLED = _env_bool("STRESS_VERIFY_ENABLED", STRESS_VERIFY_ENABLED)
     STRESS_AUTOCORRECT_ENABLED = _env_bool(
         "STRESS_AUTOCORRECT_ENABLED", STRESS_AUTOCORRECT_ENABLED
     )
+    STRESS_FILL_UNMARKED = _env_bool("STRESS_FILL_UNMARKED", STRESS_FILL_UNMARKED)
     STRESS_MISMATCH_LOG = os.getenv("STRESS_MISMATCH_LOG", STRESS_MISMATCH_LOG).strip()
     STRESS_EXCEPTION_DICT = os.getenv("STRESS_EXCEPTION_DICT", STRESS_EXCEPTION_DICT).strip()
     STRESS_VERIFY_ENGINE = os.getenv("STRESS_VERIFY_ENGINE", STRESS_VERIFY_ENGINE).strip().lower()
@@ -268,6 +365,7 @@ def load_settings() -> None:
     except ImportError:
         pass
 
+    MEDIA_DOWNLOAD_ENABLED = _env_bool("MEDIA_DOWNLOAD_ENABLED", MEDIA_DOWNLOAD_ENABLED)
     MEDIA_SEMANTIC_ENABLED = _env_bool("MEDIA_SEMANTIC_ENABLED", MEDIA_SEMANTIC_ENABLED)
     MEDIA_CANDIDATE_POOL = int(
         os.getenv("MEDIA_CANDIDATE_POOL", str(MEDIA_CANDIDATE_POOL))
@@ -717,12 +815,14 @@ def build_gemini_tts_system_prompt() -> str:
     stress = "\u0301"  # COMBINING ACUTE ACCENT (U+0301)
     return f"""Ты — лингвистический препроцессор и режиссер озвучания для системы синтеза речи (TTS). Твоя задача — подготовить текст для идеального и выразительного прочтения диктором.
 Твои строгие правила:
-1. Расставь ударения ТОЛЬКО в омографах, сложных словах, именах, фамилиях и названиях, где возможно неверное прочтение. В обычных однозначных словах (кошка, собака, дом) ударения не ставь.
-2. Ударение обозначай символом юникода U+0301, поставленным СРАЗУ ПОСЛЕ ударной гласной, в НИЖНЕМ регистре. Пример: "замо{stress}к", "Вашингто{stress}н", "за{stress}мок". КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО обозначать ударение заглавной буквой или символом плюса (+) — они не воспринимаются моделью.
-3. Переведи все числа, даты и аббревиатуры в текст прописью в правильном падеже (например: "в 1998 году" -> "в тысяча девятьсот девяносто восьмом году").
-4. Убери эмодзи и все спецсимволы. Оставь только буквы, символы ударения U+0301 и базовую пунктуацию: запятая, точка, вопросительный и восклицательный знаки.
-5. Режиссура пауз: короткую паузу обозначай ЗАПЯТОЙ, длинную драматическую — концом предложения (ТОЧКОЙ). НЕ используй тире (—) и многоточия (...): сервер заменяет их на дефис и запятую, эффект теряется. Не ставь лишних знаков в начале и конце текста. Если текст монотонный, добавь максимум одну запятую в середине длинного предложения.
-6. В ответе выдай ТОЛЬКО обработанный текст. Никаких приветствий, подтверждений или лишних комментариев."""
+1. Расставь ударения символом U+0301 СРАЗУ ПОСЛЕ ударной гласной во ВСЕХ словах от двух слогов и во всех формах, где TTS может ошибиться (существительные, глаголы, прилагательные, наречия, числительные, имена). В односложных словах ударения не ставь. Для омографов (замо{stress}к/за{stress}мок, до{stress}ма/дома{stress}) выбирай ударение по смыслу фразы.
+2. Ударение обозначай ТОЛЬКО символом юникода U+0301, поставленным СРАЗУ ПОСЛЕ обычной кириллической гласной. Пример: "замо{stress}к", "дома{stress}", "блочны{stress}е", "просыпа{stress}ться", "вашингто{stress}н". КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО: заглавная буква, плюс (+), апостроф, а также латинские буквы с акутом (á, é, í, ó, ú) — модель их не читает и начинает шуметь. Буква под ударением всегда остаётся кириллической.
+3. Орфография е/ё: сохраняй написание оригинала СИМВОЛ В СИМВОЛ. «все» (все люди, почти все) и «всё» (всё хорошо, всё как вчера) — разные слова. Если в исходнике «все», в ответе должно быть «все»; если «всё» — «всё». Не «улучшай» орфографию.
+4. Переведи все числа, даты, время и аббревиатуры в текст прописью в правильном падеже (например: "в 1998 году" -> "в ты{stress}сяча девятьсо{stress}т девяно{stress}сто восьмо{stress}м году{stress}", "06:14" -> "шесть часо{stress}в четы{stress}рнадцать мину{stress}т"). ЦИФР В ОТВЕТЕ БЫТЬ НЕ ДОЛЖНО ВООБЩЕ: токенизатор их не знает и выдаёт вместо речи шум.
+5. Буквенные аббревиатуры записывай русскими названиями букв через пробел, каждое слово с ударением: ЦРУ -> "цэ{stress} эр у{stress}", КГБ -> "ка{stress} гэ бэ{stress}", СССР -> "эс эс эс э{stress}р", ФБР -> "эф бэ{stress} эр". Латиницу не используй.
+6. Убери эмодзи и лишние спецсимволы. Оставь буквы, символы ударения U+0301 и базовую пунктуацию: запятая, точка, вопросительный и восклицательный знаки. Кавычки «» убери.
+7. Режиссура пауз: короткую паузу обозначай ЗАПЯТОЙ, длинную драматическую — концом предложения (ТОЧКОЙ). НЕ используй тире (—) и многоточия (...): сервер заменяет их на дефис и запятую. Не ставь лишних знаков в начале и конце текста. Если текст монотонный, добавь максимум одну запятую в середине длинного предложения.
+8. В ответе выдай ТОЛЬКО обработанный текст. Никаких приветствий, подтверждений или лишних комментариев."""
 
 
 def clean_gemini_plain_text(raw_text: str) -> str:
@@ -765,7 +865,7 @@ def generate_audio_with_chatterbox(text: str, output_path: Path) -> None:
         "temperature": TTS_TEMPERATURE,
         "exaggeration": TTS_EXAGGERATION,
         "cfg_weight": TTS_CFG_WEIGHT,
-        "chunk_size": 100,
+        "chunk_size": TTS_CHUNK_SIZE,
         "output_format": "wav",
         "seed": 0,
         "split_text": True,
@@ -798,13 +898,62 @@ async def generate_audio_with_chatterbox_async(text: str, output_path: Path) -> 
 
 
 def _cleanup_audio_tail(audio_path: Path) -> None:
-    """Обрезает хвостовые артефакты Chatterbox и делает fade-out (best-effort)."""
+    """Чистит паузы, обрезает хвостовые артефакты и делает fade-out (best-effort)."""
     try:
         from audio_postprocess import postprocess_file
     except ImportError:
         return  # numpy/soundfile не установлены — пропускаем пост-обработку
     try:
-        postprocess_file(audio_path)
+        if AUDIO_KEEP_RAW:
+            raw_dir = audio_path.parent / "raw"
+            raw_dir.mkdir(exist_ok=True)
+            shutil.copy2(audio_path, raw_dir / audio_path.name)
+
+        stats: dict = {}
+        postprocess_file(
+            audio_path,
+            pause_clean=AUDIO_PAUSE_CLEAN,
+            pause_enter_db=AUDIO_PAUSE_ENTER_DB,
+            pause_exit_db=AUDIO_PAUSE_EXIT_DB,
+            pause_min_ms=AUDIO_PAUSE_MIN_MS,
+            pause_guard_ms=AUDIO_PAUSE_GUARD_MS,
+            pause_bridge_max_ms=AUDIO_PAUSE_BRIDGE_MAX_MS,
+            pause_bridge_peak_db=AUDIO_PAUSE_BRIDGE_PEAK_DB,
+            pause_tail_extend_ms=AUDIO_PAUSE_TAIL_EXTEND_MS,
+            pause_tail_peak_db=AUDIO_PAUSE_TAIL_PEAK_DB,
+            stitch_clean=AUDIO_STITCH_CLEAN,
+            stitch_min_zero_ms=AUDIO_STITCH_MIN_ZERO_MS,
+            stitch_fade_before_ms=AUDIO_STITCH_FADE_BEFORE_MS,
+            vad_clean=AUDIO_VAD_CLEAN,
+            vad_aggressiveness=AUDIO_VAD_AGGRESSIVENESS,
+            vad_speech_pad_ms=AUDIO_VAD_SPEECH_PAD_MS,
+            vad_min_nonspeech_ms=AUDIO_VAD_MIN_NONSPEECH_MS,
+            spectral_clean=AUDIO_SPECTRAL_CLEAN,
+            spectral_min_region_ms=AUDIO_SPECTRAL_MIN_REGION_MS,
+            spectral_max_gap_ms=AUDIO_SPECTRAL_MAX_GAP_MS,
+            stats=stats,
+        )
+        cleaned = stats.get("pauses_cleaned", 0)
+        if cleaned:
+            print(
+                f"  ✓ Очищено пауз в {audio_path.name}: {cleaned} "
+                f"({stats.get('pauses_ms', 0.0):.0f} ms)"
+            )
+        stitches = stats.get("stitches_cleaned", 0)
+        if stitches:
+            print(f"  ✓ Смягчено стыков в {audio_path.name}: {stitches}")
+        vad_regions = stats.get("vad_regions_cleaned", 0)
+        if vad_regions:
+            print(
+                f"  ✓ VAD удалил не-речь в {audio_path.name}: {vad_regions} "
+                f"участков ({stats.get('vad_regions_ms', 0.0):.0f} ms)"
+            )
+        spectral_regions = stats.get("spectral_regions_cleaned", 0)
+        if spectral_regions:
+            print(
+                f"  ✓ Спектрально удалён шум в {audio_path.name}: {spectral_regions} "
+                f"участков ({stats.get('spectral_regions_ms', 0.0):.0f} ms)"
+            )
     except Exception as error:
         print(f"  ⚠ Пост-обработка аудио пропущена: {error}")
 
@@ -962,35 +1111,36 @@ async def process_chunk(
 
     search_prompt: str | None = None
     visual_brief: VisualBrief | None = None
-    async with gemini_semaphore:
-        try:
-            if MEDIA_SEMANTIC_ENABLED:
-                visual_brief = await generate_visual_brief_for_chunk(
-                    script_fragment, client
-                )
-                if visual_brief is None:
-                    print(
-                        "  ⚠ Визуальное описание не разобрано "
-                        "→ откат на подбор по ключевым словам"
+    if MEDIA_DOWNLOAD_ENABLED or MEDIA_TYPE == "photo":
+        async with gemini_semaphore:
+            try:
+                if MEDIA_SEMANTIC_ENABLED and MEDIA_DOWNLOAD_ENABLED:
+                    visual_brief = await generate_visual_brief_for_chunk(
+                        script_fragment, client
                     )
-                else:
-                    search_prompt = visual_brief.query
-                    log_info("Visual", visual_brief.visual)
+                    if visual_brief is None:
+                        print(
+                            "  ⚠ Визуальное описание не разобрано "
+                            "→ откат на подбор по ключевым словам"
+                        )
+                    else:
+                        search_prompt = visual_brief.query
+                        log_info("Visual", visual_brief.visual)
 
-            if not search_prompt:
-                search_prompt = await asyncio.to_thread(
-                    generate_search_prompt_for_chunk, script_fragment, client
-                )
-            if not search_prompt:
-                print("  ⚠ Gemini не вернула промпт, пропуск чанка.")
+                if not search_prompt:
+                    search_prompt = await asyncio.to_thread(
+                        generate_search_prompt_for_chunk, script_fragment, client
+                    )
+                if not search_prompt:
+                    print("  ⚠ Gemini не вернула промпт, пропуск чанка.")
+                    return ChunkResult(index, script_fragment)
+                log_search_prompt(search_prompt)
+            except (json.JSONDecodeError, ValueError) as error:
+                print(f"  ⚠ Ошибка парсинга ответа Gemini: {error}")
                 return ChunkResult(index, script_fragment)
-            log_search_prompt(search_prompt)
-        except (json.JSONDecodeError, ValueError) as error:
-            print(f"  ⚠ Ошибка парсинга ответа Gemini: {error}")
-            return ChunkResult(index, script_fragment)
-        except Exception as error:
-            print(f"  ⚠ Ошибка Gemini API: {error}")
-            return ChunkResult(index, script_fragment)
+            except Exception as error:
+                print(f"  ⚠ Ошибка Gemini API: {error}")
+                return ChunkResult(index, script_fragment)
 
     if MEDIA_TYPE != "video":
         return ChunkResult(
@@ -1007,8 +1157,22 @@ async def process_chunk(
         async with gemini_semaphore:
             processed_text = await prepare_text_with_gemini(script_fragment, client)
 
+        sanitized = sanitize_tts_text(processed_text, script_fragment)
+        processed_text = sanitized.text
+        if sanitized.latin_fixed:
+            print(f"  ✓ Латиница с акутом исправлена: {sanitized.latin_fixed} симв.")
+        if sanitized.mono_stripped:
+            print(f"  ✓ Снято ударение с односложных: {sanitized.mono_stripped} слов")
+        if sanitized.yo_restored:
+            print(f"  ✓ Восстановлено е/ё по исходнику: {sanitized.yo_restored} слов")
+        if sanitized.digits_left:
+            print(
+                f"  ⚠ В тексте остались цифры: {sanitized.digits_left} — "
+                "Chatterbox читает их нестабильно"
+            )
+
         gemini_tts_text = processed_text
-        if STRESS_VERIFY_ENABLED or STRESS_AUTOCORRECT_ENABLED:
+        if STRESS_VERIFY_ENABLED or STRESS_AUTOCORRECT_ENABLED or STRESS_FILL_UNMARKED:
             try:
                 from stress_verify import process_gemini_stress_async
 
@@ -1019,6 +1183,7 @@ async def process_chunk(
                     engine_name=STRESS_VERIFY_ENGINE,
                     verify_enabled=STRESS_VERIFY_ENABLED,
                     autocorrect_enabled=STRESS_AUTOCORRECT_ENABLED,
+                    fill_unmarked=STRESS_FILL_UNMARKED,
                 )
                 processed_text = stress_result.text
                 gemini_preview = (
@@ -1044,6 +1209,11 @@ async def process_chunk(
                         f"  ⚠ Gemini пропустила омограф: {stress_result.missed_homograph_count} слов "
                         f"→ {STRESS_MISMATCH_LOG}"
                     )
+                if stress_result.missed_unmarked_count:
+                    print(
+                        f"  ⚠ Gemini не разметила: {stress_result.missed_unmarked_count} слов "
+                        f"(без автозаполнения StressRNN) → {STRESS_MISMATCH_LOG}"
+                    )
                 if stress_result.corrected_count:
                     print(
                         f"  ✓ Автокоррекция ударений: {stress_result.corrected_count} слов "
@@ -1065,7 +1235,7 @@ async def process_chunk(
             else processed_text[:77] + "..."
         )
         log_info("TTS voice file", TTS_VOICE_FILE)
-        if not (STRESS_VERIFY_ENABLED or STRESS_AUTOCORRECT_ENABLED):
+        if not (STRESS_VERIFY_ENABLED or STRESS_AUTOCORRECT_ENABLED or STRESS_FILL_UNMARKED):
             log_info("TTS input (Gemini)", tts_preview)
         else:
             log_info("TTS input (final)", tts_preview)
@@ -1783,7 +1953,7 @@ async def async_main() -> int:
     missing_keys = []
     if not gemini_api_key:
         missing_keys.append("GEMINI_API_KEY")
-    if not pexels_api_key:
+    if MEDIA_DOWNLOAD_ENABLED and not pexels_api_key:
         missing_keys.append("PEXELS_API_KEY")
     if missing_keys:
         print(f"Ошибка: не найдены ключи в .env: {', '.join(missing_keys)}")
@@ -1812,6 +1982,10 @@ async def async_main() -> int:
     if removed_files:
         log_info("Cleanup", f"удалено {removed_files} старых файлов из downloads")
     log_info("Media type", MEDIA_TYPE)
+    log_info(
+        "Media download",
+        "on" if MEDIA_DOWNLOAD_ENABLED else "off (только аудио)",
+    )
     log_info("Orientation", ORIENTATION)
     log_info("Global vibe", GLOBAL_VIBE or "(не задан)")
     if MEDIA_TYPE == "video":
@@ -1826,12 +2000,17 @@ async def async_main() -> int:
         log_info("TTS temperature", str(TTS_TEMPERATURE))
         log_info("TTS exaggeration", str(TTS_EXAGGERATION))
         log_info("TTS cfg_weight", str(TTS_CFG_WEIGHT))
+        log_info("TTS chunk size", str(TTS_CHUNK_SIZE))
         log_info("Stress verify", "on" if STRESS_VERIFY_ENABLED else "off")
         log_info(
             "Stress autocorrect",
             "on" if STRESS_AUTOCORRECT_ENABLED else "off",
         )
-        if STRESS_VERIFY_ENABLED or STRESS_AUTOCORRECT_ENABLED:
+        log_info(
+            "Stress fill unmarked",
+            "on" if STRESS_FILL_UNMARKED else "off",
+        )
+        if STRESS_VERIFY_ENABLED or STRESS_AUTOCORRECT_ENABLED or STRESS_FILL_UNMARKED:
             log_info("Stress engine", STRESS_VERIFY_ENGINE)
             log_info("Stress log", STRESS_MISMATCH_LOG)
             log_info("Stress exception dict", STRESS_EXCEPTION_DICT)
@@ -1839,6 +2018,40 @@ async def async_main() -> int:
             "Audio postprocess",
             "per chunk (VAD tail trim + fade-out до склейки; склейки нет — 1 чанк = 1 WAV)",
         )
+        log_info("Pause cleanup", "on" if AUDIO_PAUSE_CLEAN else "off")
+        log_info(
+            "Stitch cleanup",
+            (
+                f"on ({AUDIO_STITCH_FADE_BEFORE_MS:.0f} ms before boundary)"
+                if AUDIO_STITCH_CLEAN
+                else "off"
+            ),
+        )
+        log_info(
+            "WebRTC VAD cleanup",
+            (
+                f"on (mode {AUDIO_VAD_AGGRESSIVENESS}, "
+                f"speech guard {AUDIO_VAD_SPEECH_PAD_MS:.0f} ms)"
+                if AUDIO_VAD_CLEAN
+                else "off"
+            ),
+        )
+        log_info(
+            "Spectral noise cleanup",
+            (
+                f"on (min {AUDIO_SPECTRAL_MIN_REGION_MS:.0f} ms)"
+                if AUDIO_SPECTRAL_CLEAN
+                else "off"
+            ),
+        )
+        log_info("Keep raw audio", "on (downloads/raw)" if AUDIO_KEEP_RAW else "off")
+        if AUDIO_PAUSE_CLEAN:
+            log_info(
+                "Pause thresholds",
+                f"enter {AUDIO_PAUSE_ENTER_DB} dB / exit {AUDIO_PAUSE_EXIT_DB} dB, "
+                f"min {AUDIO_PAUSE_MIN_MS:.0f} ms, guard {AUDIO_PAUSE_GUARD_MS:.0f} ms, "
+                f"bridge {AUDIO_PAUSE_BRIDGE_MAX_MS:.0f} ms @ {AUDIO_PAUSE_BRIDGE_PEAK_DB:.0f} dB",
+            )
 
     log_section("ГЕНЕРАЦИЯ ПРОМПТОВ И ОЗВУЧКИ")
     log_info("Model", GEMINI_MODEL)
@@ -1868,53 +2081,68 @@ async def async_main() -> int:
         gemini_semaphore,
     )
 
-    ready_chunks = [
-        chunk_result
-        for chunk_result in chunk_results
-        if chunk_result.search_prompt
-    ]
+    if MEDIA_DOWNLOAD_ENABLED:
+        ready_chunks = [
+            chunk_result
+            for chunk_result in chunk_results
+            if chunk_result.search_prompt
+        ]
+        if not ready_chunks:
+            print("\nПромпты не сгенерированы, скачивание невозможно.")
+            return 1
 
-    if not ready_chunks:
-        print("\nПромпты не сгенерированы, скачивание невозможно.")
-        return 1
+        save_prompts([chunk.search_prompt for chunk in ready_chunks])
+        print(f"\n  ✓ Сохранено {len(ready_chunks)} промптов в {PROMPTS_FILE}")
 
-    save_prompts([chunk.search_prompt for chunk in ready_chunks])
-    print(f"\n  ✓ Сохранено {len(ready_chunks)} промптов в {PROMPTS_FILE}")
+        used_media_store = UsedMediaStore(USED_MEDIA_STORE)
+        registry = MediaRegistry(store=used_media_store)
+        selection_log = MediaSelectionLog(MEDIA_SELECTION_LOG, run_id)
 
-    used_media_store = UsedMediaStore(USED_MEDIA_STORE)
-    registry = MediaRegistry(store=used_media_store)
-    selection_log = MediaSelectionLog(MEDIA_SELECTION_LOG, run_id)
+        download_label = (
+            "СКАЧИВАНИЕ ФОТО" if MEDIA_TYPE == "photo" else "СКАЧИВАНИЕ И СИНХРОНИЗАЦИЯ ВИДЕО"
+        )
+        log_section(download_label)
+        log_info("Orientation", ORIENTATION)
+        if MEDIA_TYPE == "video":
+            log_info("Sync mode", "FFmpeg trim to audio duration")
+        log_info("Output dir", str(output_dir.resolve()))
+        log_info("Chunks ready", str(len(ready_chunks)))
+        log_info("Concurrency", str(MAX_CONCURRENT_REQUESTS))
+        log_info("Semantic match", "on" if MEDIA_SEMANTIC_ENABLED else "off")
+        if MEDIA_SEMANTIC_ENABLED:
+            log_info("Ranker", MEDIA_RANKER)
+            log_info("Candidate pool", str(MEDIA_CANDIDATE_POOL))
+        log_info(
+            "Used media store",
+            f"{USED_MEDIA_STORE} ({len(used_media_store)} клипов из прошлых прогонов)",
+        )
+        log_info("Selection log", MEDIA_SELECTION_LOG)
 
-    download_label = "СКАЧИВАНИЕ ФОТО" if MEDIA_TYPE == "photo" else "СКАЧИВАНИЕ И СИНХРОНИЗАЦИЯ ВИДЕО"
-    log_section(download_label)
-    log_info("Orientation", ORIENTATION)
-    if MEDIA_TYPE == "video":
-        log_info("Sync mode", "FFmpeg trim to audio duration")
-    log_info("Output dir", str(output_dir.resolve()))
-    log_info("Chunks ready", str(len(ready_chunks)))
-    log_info("Concurrency", str(MAX_CONCURRENT_REQUESTS))
-    log_info("Semantic match", "on" if MEDIA_SEMANTIC_ENABLED else "off")
-    if MEDIA_SEMANTIC_ENABLED:
-        log_info("Ranker", MEDIA_RANKER)
-        log_info("Candidate pool", str(MEDIA_CANDIDATE_POOL))
-    log_info(
-        "Used media store",
-        f"{USED_MEDIA_STORE} ({len(used_media_store)} клипов из прошлых прогонов)",
-    )
-    log_info("Selection log", MEDIA_SELECTION_LOG)
-
-    success_count = await process_all_media(
-        chunk_results,
-        pexels_api_key,
-        pixabay_api_key,
-        output_dir,
-        registry,
-        client,
-        selection_log,
-    )
+        success_count = await process_all_media(
+            chunk_results,
+            pexels_api_key,
+            pixabay_api_key,
+            output_dir,
+            registry,
+            client,
+            selection_log,
+        )
+    else:
+        ready_chunks = [
+            chunk_result
+            for chunk_result in chunk_results
+            if chunk_result.audio_path is not None
+            and is_valid_audio_file(chunk_result.audio_path)
+        ]
+        if not ready_chunks:
+            print("\nАудио не сгенерировано.")
+            return 1
+        success_count = len(ready_chunks)
 
     log_section("ИТОГ")
-    if MEDIA_TYPE == "video":
+    if not MEDIA_DOWNLOAD_ENABLED and MEDIA_TYPE == "video":
+        print(f"  Готово аудио: {success_count} из {len(chunks)}")
+    elif MEDIA_TYPE == "video":
         print(f"  Готово пар (audio + video): {success_count} из {len(ready_chunks)}")
     else:
         print(f"  Скачано: {success_count} из {len(ready_chunks)}")

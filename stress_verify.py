@@ -2,6 +2,8 @@
 
 Сравнивает позицию U+0301 в словах Gemini с офлайн-словарём. Омографы остаются
 за Gemini; для однозначных слов при включённом STRESS_AUTOCORRECT — подмена ударения.
+Доразметка неразмеченных слов StressRNN (fill_unmarked) по умолчанию выключена:
+Gemini размечает текст, StressRNN сверяет и при autocorrect исправляет ошибки.
 """
 
 from __future__ import annotations
@@ -213,6 +215,8 @@ STRESS_HOMOGRAPHS: frozenset[str] = frozenset(
         "запахом",
         "запахе",
         "запахи",
+        # до́ма (наречие) / дома́ (мн.ч.)
+        "дома",
     }
 )
 
@@ -222,6 +226,26 @@ SOROKA_FORMS: frozenset[str] = frozenset(
 )
 AGE_CONTEXT_MARKERS: frozenset[str] = frozenset(
     {"лет", "год", "года", "году", "годом", "годе", "годам", "годами", "годов"}
+)
+
+# «Дома» — до́ма (наречие) vs дома́ (мн.ч. сущ.); см. resolve_doma_vowel_index().
+DOMA_FORMS: frozenset[str] = frozenset({"дома"})
+DOMA_PLURAL_AFTER_MARKERS: frozenset[str] = frozenset(
+    {
+        "уходят",
+        "идут",
+        "стоят",
+        "тянутся",
+        "видны",
+        "виднеются",
+        "лежат",
+        "смотрят",
+        "остались",
+        "горят",
+    }
+)
+DOMA_ADVERB_BEFORE_MARKERS: frozenset[str] = frozenset(
+    {"идти", "ехать", "вернуться", "остаться", "пойти", "прийти", "бежать"}
 )
 
 
@@ -297,6 +321,7 @@ class StressProcessResult:
     homograph_mismatch_count: int = 0
     filled_count: int = 0
     missed_homograph_count: int = 0
+    missed_unmarked_count: int = 0
 
 
 def is_vowel(ch: str) -> bool:
@@ -382,14 +407,38 @@ def is_homograph(plain_word: str) -> bool:
     return False
 
 
+def context_tokens(text: str) -> list[str]:
+    """Слова текста без U+0301: иначе ударение разрывает слово на два токена."""
+    return re.findall(r"[а-яё]+", text.replace(COMBINING_ACUTE, "").lower())
+
+
 def is_soroka_age_context(full_text: str, word_start: int) -> bool:
     """True, если «сорок*» в контексте возраста (лет/год в 1–2 словах до)."""
     before = full_text[:word_start]
-    tokens = re.findall(r"[а-яё]+", before.lower())
+    tokens = context_tokens(before)
     if not tokens:
         return False
     window = tokens[-2:]
     return any(token in AGE_CONTEXT_MARKERS for token in window)
+
+
+def resolve_doma_vowel_index(full_text: str, word_start: int) -> int | None:
+    """Индекс ударной гласной в «дома» по контексту, или None если неоднозначно."""
+    after = full_text[word_start:]
+    before = full_text[:word_start]
+    after_tokens = context_tokens(after)
+    before_tokens = context_tokens(before)
+    if after_tokens and after_tokens[0] == "дома":
+        after_tokens = after_tokens[1:6]
+    if any(token in DOMA_PLURAL_AFTER_MARKERS for token in after_tokens[:3]):
+        return 1
+    if before_tokens:
+        prev = before_tokens[-1]
+        if prev.endswith(("ые", "ие", "ая", "ое", "ий", "ой")):
+            return 1
+        if prev in DOMA_ADVERB_BEFORE_MARKERS:
+            return 0
+    return None
 
 
 def should_preserve_gemini_stress(
@@ -400,8 +449,8 @@ def should_preserve_gemini_stress(
         return True, "homograph"
     if plain_word in SOROKA_FORMS:
         if is_soroka_age_context(full_text, word_start):
-            return False, "age_context"
-        return True, "bird_context"
+            return True, "age_context"
+        return False, "bird_context"
     return False, None
 
 
@@ -554,6 +603,35 @@ def _process_marked_word(
     counters: dict[str, int],
 ) -> str:
     """Слово с U+0301 от Gemini: сравнение, автокоррекция, mismatch."""
+    if plain in DOMA_FORMS:
+        doma_idx = resolve_doma_vowel_index(gemini_text, word_start)
+        if doma_idx is not None and gemini_idx != doma_idx:
+            context_tag = "plural_homes" if doma_idx == 1 else "adverb_homes"
+            output_token = token
+            event: str | None = None
+            if autocorrect_enabled:
+                output_token = apply_dict_stress_to_token(token, doma_idx)
+                event = "auto_corrected"
+                counters["corrected"] += 1
+            elif verify_enabled:
+                event = "mismatch"
+                counters["mismatch"] += 1
+            if event:
+                log_lines.append(
+                    _format_log_line(
+                        event,
+                        chunk_index,
+                        plain,
+                        token,
+                        f"дома+({'а' if doma_idx == 1 else 'о'})",
+                        gemini_idx,
+                        doma_idx,
+                        corrected=output_token if event == "auto_corrected" else None,
+                        context_tag=context_tag,
+                    )
+                )
+            return output_token
+
     try:
         dict_marked, dict_idx = _lookup_dict_stress(engine, plain, engine_name)
     except Exception as error:
@@ -618,11 +696,55 @@ def _process_unmarked_word(
     plain: str,
     engine: StressEngine,
     engine_name: str,
+    gemini_text: str,
+    word_start: int,
     chunk_index: int | None,
+    fill_unmarked: bool,
     log_lines: list[str],
     counters: dict[str, int],
 ) -> str:
-    """Слово без U+0301: доразметка StressRNN или пропуск омографа."""
+    """Слово без U+0301: контекстные правила, опциональная доразметка StressRNN."""
+    if plain in SOROKA_FORMS and is_soroka_age_context(gemini_text, word_start):
+        # Возрастной контекст ("лет сорока") — ударение всегда на последнюю гласную,
+        # словарь StressRNN тут не годится: его дефолт — произношение для птицы.
+        vowel_count = count_vowels_in_plain(plain)
+        output_token = apply_dict_stress_to_token(token, vowel_count - 1)
+        log_lines.append(
+            _format_log_line(
+                "gemini_missed_filled",
+                chunk_index,
+                plain,
+                token,
+                None,
+                None,
+                vowel_count - 1,
+                corrected=output_token,
+                context_tag="age_context",
+            )
+        )
+        counters["filled"] += 1
+        return output_token
+
+    if plain in DOMA_FORMS:
+        doma_idx = resolve_doma_vowel_index(gemini_text, word_start)
+        if doma_idx is not None:
+            output_token = apply_dict_stress_to_token(token, doma_idx)
+            log_lines.append(
+                _format_log_line(
+                    "gemini_missed_filled",
+                    chunk_index,
+                    plain,
+                    token,
+                    None,
+                    None,
+                    doma_idx,
+                    corrected=output_token,
+                    context_tag="plural_homes" if doma_idx == 1 else "adverb_homes",
+                )
+            )
+            counters["filled"] += 1
+            return output_token
+
     if is_homograph(plain):
         try:
             dict_marked, dict_idx = _lookup_dict_stress(engine, plain, engine_name)
@@ -641,6 +763,21 @@ def _process_unmarked_word(
             )
         )
         counters["missed_homograph"] += 1
+        return token
+
+    if not fill_unmarked:
+        log_lines.append(
+            _format_log_line(
+                "gemini_missed_unmarked",
+                chunk_index,
+                plain,
+                token,
+                None,
+                None,
+                None,
+            )
+        )
+        counters["missed_unmarked"] += 1
         return token
 
     try:
@@ -692,9 +829,10 @@ def process_gemini_stress(
     engine_name: str = "stressrnn",
     verify_enabled: bool = True,
     autocorrect_enabled: bool = False,
+    fill_unmarked: bool = False,
 ) -> StressProcessResult:
-    """Проверяет/доразмечает ударения для всех слов с 2+ гласными."""
-    if not verify_enabled and not autocorrect_enabled:
+    """Сверяет ударения Gemini со словарём; опционально исправляет и доразмечает."""
+    if not verify_enabled and not autocorrect_enabled and not fill_unmarked:
         return StressProcessResult(text=gemini_text)
 
     engine = get_engine(engine_name)
@@ -707,6 +845,7 @@ def process_gemini_stress(
         "homograph_mismatch": 0,
         "filled": 0,
         "missed_homograph": 0,
+        "missed_unmarked": 0,
     }
 
     for match in MARKED_WORD_RE.finditer(gemini_text):
@@ -745,7 +884,10 @@ def process_gemini_stress(
                 plain=plain,
                 engine=engine,
                 engine_name=engine_name,
+                gemini_text=gemini_text,
+                word_start=word_start,
                 chunk_index=chunk_index,
+                fill_unmarked=fill_unmarked,
                 log_lines=log_lines,
                 counters=counters,
             )
@@ -765,6 +907,7 @@ def process_gemini_stress(
         homograph_mismatch_count=counters["homograph_mismatch"],
         filled_count=counters["filled"],
         missed_homograph_count=counters["missed_homograph"],
+        missed_unmarked_count=counters["missed_unmarked"],
     )
 
 
@@ -830,6 +973,7 @@ async def process_gemini_stress_async(
     engine_name: str = "stressrnn",
     verify_enabled: bool = True,
     autocorrect_enabled: bool = False,
+    fill_unmarked: bool = False,
 ) -> StressProcessResult:
     """CPU-bound обёртка для asyncio."""
     return await asyncio.to_thread(
@@ -840,6 +984,7 @@ async def process_gemini_stress_async(
         engine_name=engine_name,
         verify_enabled=verify_enabled,
         autocorrect_enabled=autocorrect_enabled,
+        fill_unmarked=fill_unmarked,
     )
 
 

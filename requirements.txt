@@ -6,6 +6,7 @@ requests>=2.31.0
 # и оставшегося в глобальном окружении rvc-python.
 numpy==1.23.5
 soundfile>=0.12.1
+webrtcvad-wheels>=2.0.14
 protobuf>=6.31.1,<8
 # Офлайн-проверка ударений Gemini (StressRNN + словарь Зализняка)
 stressrnn @ git+https://github.com/dbklim/StressRNN.git
