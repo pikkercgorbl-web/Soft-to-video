@@ -25,3 +25,7 @@ media_selection.log
 
 # Кэш конвертации U+0301 → '+' для StressRNN (генерируется из exception_dictionary.txt)
 *.stressrnn.txt
+
+# Local project artifacts
+projects/
+.venv/

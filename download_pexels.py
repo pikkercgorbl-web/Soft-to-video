@@ -2,6 +2,7 @@
 """Автоматическое скачивание медиа со стоков: сценарий → Gemini → TTS-prep (Gemini) → Chatterbox → Pexels / Pixabay → FFmpeg."""
 
 import asyncio
+import argparse
 import json
 import logging
 import os
@@ -9,7 +10,7 @@ import re
 import shutil
 import sys
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,8 @@ import aiohttp
 import requests
 from google import genai
 from dotenv import load_dotenv
+from filelock import FileLock, Timeout
+from project_state import Project, atomic_json, file_hash, fingerprint
 
 from media_semantic import (
     EmbeddingRanker,
@@ -128,8 +131,6 @@ VIDEO_TRIM_PADDING = 0.3
 AUDIO_WRITE_POLL_INTERVAL = 0.5
 AUDIO_WRITE_MAX_WAIT = 60.0
 
-CLEANUP_EXTENSIONS = {".mp4", ".mp3", ".wav", ".txt"}
-
 PEXELS_VIDEO_SEARCH_URL = "https://api.pexels.com/v1/videos/search"
 PEXELS_PHOTO_SEARCH_URL = "https://api.pexels.com/v1/search"
 PIXABAY_VIDEO_SEARCH_URL = "https://pixabay.com/api/videos/"
@@ -143,6 +144,37 @@ PROMPTS_FILE = "prompts.txt"
 DOWNLOADS_DIR = "downloads"
 REQUEST_TIMEOUT = 60
 GEMINI_MODEL = "gemini-2.5-flash"
+PROJECT: Project | None = None
+TTS_SEMAPHORE: asyncio.Semaphore | None = None
+RUN_MEDIA: dict[int, str] = {}
+
+
+def stage_settings(kind: str) -> dict:
+    # Explicit groups keep visual changes independent of the audio cache.
+    if kind == "audio":
+        names = [name for name in globals() if name.startswith(("TTS_", "AUDIO_", "STRESS_"))
+                 and name not in {"TTS_SEMAPHORE", "STRESS_MISMATCH_LOG"}]
+        names += ["GEMINI_MODEL", "CHATTERBOX_TTS_URL"]
+    else:
+        names = ["GEMINI_MODEL", "GLOBAL_VIBE", "MEDIA_TYPE", "MEDIA_SEMANTIC_ENABLED",
+                 "MEDIA_DOWNLOAD_ENABLED", "MEDIA_RANKER", "MEDIA_EMBEDDING_MODEL",
+                 "MEDIA_CANDIDATE_POOL", "ORIENTATION", "VIDEO_TRIM_PADDING"]
+    result = {name: globals()[name] for name in names
+              if isinstance(globals()[name], (str, int, float, bool))}
+    if "CHATTERBOX_TTS_URL" in result:
+        result["CHATTERBOX_TTS_URL"] = fingerprint(result["CHATTERBOX_TTS_URL"])
+    result["pipeline_revision"] = fingerprint({
+        name: file_hash(Path(__file__).parent / name)
+        for name in ("download_pexels.py", "media_semantic.py", "audio_postprocess.py",
+                     "tts_text_sanitize.py", "stress_verify.py", "project_state.py")
+    })
+    if kind == "audio":
+        dictionary = Path(STRESS_EXCEPTION_DICT)
+        result["dictionary_hash"] = file_hash(dictionary) if dictionary.is_file() else None
+        result["server_revision"] = os.getenv("TTS_CACHE_REVISION", "1")
+        result["declared_model"] = os.getenv("TTS_MODEL_ID", "unknown")
+    return result
+
 
 
 @dataclass
@@ -268,6 +300,7 @@ def _env_bool(name: str, default: bool) -> bool:
 def load_settings() -> None:
     """Загружает глобальные настройки из .env."""
     global MEDIA_TYPE, ORIENTATION, GLOBAL_VIBE, CHATTERBOX_TTS_URL
+    global TTS_LANGUAGE, TTS_VOICE_FILE, TTS_VOICE_MODE
     global TTS_SERVER_TIMEOUT, SCRIPT_CHUNK_MAX_CHARS, FAILED_CHUNKS_LOG
     global TTS_SPEED_FACTOR, TTS_TEMPERATURE, TTS_EXAGGERATION, TTS_CFG_WEIGHT, TTS_CHUNK_SIZE
     global AUDIO_PAUSE_CLEAN, AUDIO_PAUSE_ENTER_DB, AUDIO_PAUSE_EXIT_DB
@@ -286,6 +319,9 @@ def load_settings() -> None:
 
     load_dotenv()
 
+    TTS_LANGUAGE = os.getenv("TTS_LANGUAGE", TTS_LANGUAGE).strip()
+    TTS_VOICE_FILE = os.getenv("TTS_VOICE_FILE", TTS_VOICE_FILE).strip()
+    TTS_VOICE_MODE = os.getenv("TTS_VOICE_MODE", TTS_VOICE_MODE).strip()
     MEDIA_TYPE = os.getenv("MEDIA_TYPE", MEDIA_TYPE).strip().lower()
     ORIENTATION = os.getenv("ORIENTATION", ORIENTATION).strip().lower()
     GLOBAL_VIBE = os.getenv("GLOBAL_VIBE", GLOBAL_VIBE).strip()
@@ -422,17 +458,6 @@ def build_raw_video_path(index: int, output_dir: Path) -> Path:
 def build_photo_path(index: int, prompt: str, output_dir: Path) -> Path:
     name = re.sub(r'[<>:"/\\|?*]', "", prompt.replace(" ", "_"))
     return output_dir / f"{index:03d}_{name}{get_file_extension()}"
-
-
-def cleanup_downloads_dir(output_dir: Path) -> int:
-    """Удаляет старые .mp4, .wav, .mp3 и .txt из папки downloads перед новым запуском."""
-    output_dir.mkdir(exist_ok=True)
-    removed = 0
-    for file_path in output_dir.iterdir():
-        if file_path.is_file() and file_path.suffix.lower() in CLEANUP_EXTENSIONS:
-            file_path.unlink()
-            removed += 1
-    return removed
 
 
 def is_valid_audio_file(audio_path: Path) -> bool:
@@ -894,7 +919,11 @@ def generate_audio_with_chatterbox(text: str, output_path: Path) -> None:
 
 async def generate_audio_with_chatterbox_async(text: str, output_path: Path) -> None:
     """Асинхронная обёртка над HTTP-запросом к Chatterbox TTS."""
-    await asyncio.to_thread(generate_audio_with_chatterbox, text, output_path)
+    if TTS_SEMAPHORE is None:
+        await asyncio.to_thread(generate_audio_with_chatterbox, text, output_path)
+    else:
+        async with TTS_SEMAPHORE:
+            await asyncio.to_thread(generate_audio_with_chatterbox, text, output_path)
 
 
 def _cleanup_audio_tail(audio_path: Path) -> None:
@@ -1109,6 +1138,32 @@ async def process_chunk(
     )
     log_info("Script fragment", preview)
 
+    search_prompt, visual_brief = await prepare_visual(index, script_fragment, client, gemini_semaphore)
+    if MEDIA_TYPE != "video":
+        return ChunkResult(index, script_fragment, search_prompt=search_prompt, visual_brief=visual_brief)
+
+    stage = PROJECT.stage("audio", index, {"text": script_fragment, "settings": stage_settings("audio")}) if PROJECT else None
+    if stage:
+        cached = stage.cached()
+        if cached:
+            audio_path = stage.path / cached["audio_file"]
+            duration = await resolve_audio_duration(audio_path)
+            if duration is not None:
+                log_info("Resume audio", audio_path.name)
+                return ChunkResult(index, script_fragment, search_prompt, audio_path, duration, visual_brief)
+        stage.start()
+        output_dir = stage.path
+    result = await generate_chunk_audio(index, total, script_fragment, client, output_dir,
+                                        gemini_semaphore, search_prompt, visual_brief)
+    if stage:
+        if result.audio_path and result.audio_duration:
+            stage.finish({"audio_file": result.audio_path.name}, [result.audio_path])
+        else:
+            stage.fail("Audio generation failed; see project logs")
+    return result
+
+
+async def _prepare_visual_uncached(index, script_fragment, client, gemini_semaphore):
     search_prompt: str | None = None
     visual_brief: VisualBrief | None = None
     if MEDIA_DOWNLOAD_ENABLED or MEDIA_TYPE == "photo":
@@ -1133,23 +1188,38 @@ async def process_chunk(
                     )
                 if not search_prompt:
                     print("  ⚠ Gemini не вернула промпт, пропуск чанка.")
-                    return ChunkResult(index, script_fragment)
+                    return None, None
                 log_search_prompt(search_prompt)
             except (json.JSONDecodeError, ValueError) as error:
                 print(f"  ⚠ Ошибка парсинга ответа Gemini: {error}")
-                return ChunkResult(index, script_fragment)
+                return None, None
             except Exception as error:
                 print(f"  ⚠ Ошибка Gemini API: {error}")
-                return ChunkResult(index, script_fragment)
+                return None, None
 
-    if MEDIA_TYPE != "video":
-        return ChunkResult(
-            index,
-            script_fragment,
-            search_prompt=search_prompt,
-            visual_brief=visual_brief,
-        )
+    return search_prompt, visual_brief
 
+
+async def prepare_visual(index, script_fragment, client, gemini_semaphore):
+    if not (MEDIA_DOWNLOAD_ENABLED or MEDIA_TYPE == "photo"):
+        return None, None
+    stage = PROJECT.stage("visual", index, {"text": script_fragment, "settings": stage_settings("visual")}) if PROJECT else None
+    if stage:
+        cached = stage.cached()
+        if cached:
+            return cached["prompt"], VisualBrief(**cached["brief"]) if cached["brief"] else None
+        stage.start()
+    prompt, brief = await _prepare_visual_uncached(index, script_fragment, client, gemini_semaphore)
+    if stage:
+        if prompt:
+            stage.finish({"prompt": prompt, "brief": asdict(brief) if brief else None})
+        else:
+            stage.fail("Visual request failed; audio can still proceed")
+    return prompt, brief
+
+
+async def generate_chunk_audio(index, total, script_fragment, client, output_dir,
+                               gemini_semaphore, search_prompt=None, visual_brief=None):
     final_audio_path = build_audio_path(index, output_dir)
     processed_text: str | None = None
 
@@ -1330,9 +1400,7 @@ def build_media_tasks(chunk_results: list[ChunkResult], output_dir: Path) -> lis
             )
             continue
 
-        audio_path = build_audio_path(index, output_dir)
-        if chunk_result.audio_path != audio_path:
-            chunk_result.audio_path.rename(audio_path)
+        audio_path = chunk_result.audio_path
 
         if not is_valid_audio_file(audio_path):
             print(
@@ -1694,7 +1762,38 @@ def format_not_found_message(min_duration: float | None = None) -> str:
     return ", ".join(parts)
 
 
-async def process_video_task(
+async def process_video_task(task, total, session, pexels_api_key, pixabay_api_key,
+                             registry, semaphore, gemini_client=None, selection_log=None):
+    stage = PROJECT.stage("video", task.index, {
+        "prompt": task.prompt, "brief": asdict(task.visual_brief) if task.visual_brief else None,
+        "audio_hash": file_hash(task.audio_path), "settings": stage_settings("visual"),
+    }) if PROJECT else None
+    if stage:
+        cached = stage.cached()
+        if cached:
+            RUN_MEDIA[task.index] = str((stage.path / cached["video_file"]).resolve())
+            log_info("Resume video", str(stage.path))
+            return True
+        stage.start()
+        task = replace(task, video_path=build_video_path(task.index, stage.path),
+                       raw_video_path=build_raw_video_path(task.index, stage.path))
+    try:
+        success = await _process_video_task_uncached(task, total, session, pexels_api_key,
+                    pixabay_api_key, registry, semaphore, gemini_client, selection_log)
+        if stage:
+            if success:
+                stage.finish({"video_file": task.video_path.name}, [task.video_path])
+                RUN_MEDIA[task.index] = str(task.video_path.resolve())
+            else:
+                stage.fail("Video selection/download failed")
+        return success
+    except Exception:
+        if stage:
+            stage.fail("Video task raised an exception; rerun to retry")
+        raise
+
+
+async def _process_video_task_uncached(
     task: MediaTask,
     total: int,
     session: aiohttp.ClientSession,
@@ -1826,7 +1925,29 @@ async def process_video_task(
         return True
 
 
-async def process_photo_prompt(
+async def process_photo_prompt(index, total, prompt, session, pexels_api_key,
+                               pixabay_api_key, output_path, registry, semaphore):
+    stage = PROJECT.stage("photo", index, {"prompt": prompt, "settings": stage_settings("visual")}) if PROJECT else None
+    if stage:
+        cached = stage.cached()
+        if cached:
+            RUN_MEDIA[index] = str((stage.path / cached["photo_file"]).resolve())
+            log_info("Resume photo", str(stage.path))
+            return True
+        stage.start()
+        output_path = build_photo_path(index, prompt, stage.path)
+    success = await _process_photo_prompt_uncached(index, total, prompt, session,
+                    pexels_api_key, pixabay_api_key, output_path, registry, semaphore)
+    if stage:
+        if success:
+            stage.finish({"photo_file": output_path.name}, [output_path])
+            RUN_MEDIA[index] = str(output_path.resolve())
+        else:
+            stage.fail("Photo selection/download failed")
+    return success
+
+
+async def _process_photo_prompt_uncached(
     index: int,
     total: int,
     prompt: str,
@@ -1939,6 +2060,9 @@ async def process_all_media(
 
 
 async def async_main() -> int:
+    global TTS_SEMAPHORE, FAILED_CHUNKS_LOG, STRESS_MISMATCH_LOG, MEDIA_SELECTION_LOG
+    TTS_SEMAPHORE = asyncio.Semaphore(1)
+    RUN_MEDIA.clear()
     try:
         load_settings()
     except ValueError as error:
@@ -1974,13 +2098,17 @@ async def async_main() -> int:
         print("Не удалось разбить сценарий на части.")
         return 1
 
-    output_dir = Path(DOWNLOADS_DIR)
-    output_dir.mkdir(exist_ok=True)
-    removed_files = cleanup_downloads_dir(output_dir)
+    output_dir = PROJECT.path if PROJECT else Path(DOWNLOADS_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if PROJECT:
+        (output_dir / "scripts").mkdir(exist_ok=True)
+        (output_dir / "scripts" / (fingerprint(script_text) + ".txt")).write_text(script_text, encoding="utf-8")
+        FAILED_CHUNKS_LOG = str(output_dir / "failed_chunks.log")
+        STRESS_MISMATCH_LOG = str(output_dir / "stress_mismatches.log")
+        MEDIA_SELECTION_LOG = str(output_dir / "media_selection.log")
 
     log_section("НАСТРОЙКИ")
-    if removed_files:
-        log_info("Cleanup", f"удалено {removed_files} старых файлов из downloads")
+    log_info("Project", str(output_dir.resolve()))
     log_info("Media type", MEDIA_TYPE)
     log_info(
         "Media download",
@@ -2044,7 +2172,7 @@ async def async_main() -> int:
                 else "off"
             ),
         )
-        log_info("Keep raw audio", "on (downloads/raw)" if AUDIO_KEEP_RAW else "off")
+        log_info("Keep raw audio", "on (raw beside each audio result)" if AUDIO_KEEP_RAW else "off")
         if AUDIO_PAUSE_CLEAN:
             log_info(
                 "Pause thresholds",
@@ -2087,12 +2215,9 @@ async def async_main() -> int:
             for chunk_result in chunk_results
             if chunk_result.search_prompt
         ]
-        if not ready_chunks:
-            print("\nПромпты не сгенерированы, скачивание невозможно.")
-            return 1
 
-        save_prompts([chunk.search_prompt for chunk in ready_chunks])
-        print(f"\n  ✓ Сохранено {len(ready_chunks)} промптов в {PROMPTS_FILE}")
+        save_prompts([chunk.search_prompt for chunk in ready_chunks], str(output_dir / "prompts.txt"))
+        print(f"\n  ✓ Сохранено {len(ready_chunks)} промптов в {output_dir / 'prompts.txt'}")
 
         used_media_store = UsedMediaStore(USED_MEDIA_STORE)
         registry = MediaRegistry(store=used_media_store)
@@ -2134,23 +2259,47 @@ async def async_main() -> int:
             if chunk_result.audio_path is not None
             and is_valid_audio_file(chunk_result.audio_path)
         ]
-        if not ready_chunks:
-            print("\nАудио не сгенерировано.")
-            return 1
         success_count = len(ready_chunks)
 
     log_section("ИТОГ")
     if not MEDIA_DOWNLOAD_ENABLED and MEDIA_TYPE == "video":
         print(f"  Готово аудио: {success_count} из {len(chunks)}")
     elif MEDIA_TYPE == "video":
-        print(f"  Готово пар (audio + video): {success_count} из {len(ready_chunks)}")
+        print(f"  Готово пар (audio + video): {success_count} из {len(chunks)}")
     else:
-        print(f"  Скачано: {success_count} из {len(ready_chunks)}")
-    return 0 if success_count > 0 else 1
+        print(f"  Скачано: {success_count} из {len(chunks)}")
+    complete = success_count == len(chunks)
+    atomic_json(output_dir / "run_summary.json", {
+        "status": "completed" if complete else "partial", "expected": len(chunks),
+        "completed": success_count, "script_hash": fingerprint(script_text),
+        "chunks": [{"index": c.chunk_index, "text": c.chunk_text,
+                    "audio": str(c.audio_path.resolve()) if c.audio_path else None,
+                    "search_prompt": c.search_prompt,
+                    "media": RUN_MEDIA.get(c.chunk_index)} for c in chunk_results],
+    })
+    return 0 if complete else 1
 
 
 def main() -> int:
-    return asyncio.run(async_main())
+    global PROJECT, SCRIPT_FILE
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--script", default=SCRIPT_FILE)
+    parser.add_argument("--project", help="Stable project name (letters, digits, _ and -)")
+    parser.add_argument("--projects-dir", default="projects")
+    args = parser.parse_args()
+    SCRIPT_FILE = args.script
+    try:
+        script = read_script(SCRIPT_FILE)
+        name = args.project or "video-" + fingerprint(script)[:12]
+        PROJECT = Project(Path(args.projects_dir), name)
+        with FileLock(str(PROJECT.path / ".run.lock"), timeout=0):
+            return asyncio.run(async_main())
+    except Timeout:
+        print("Этот проект уже обрабатывается другим процессом.")
+        return 1
+    except (OSError, ValueError) as error:
+        print(f"Ошибка проекта: {error}")
+        return 1
 
 
 if __name__ == "__main__":

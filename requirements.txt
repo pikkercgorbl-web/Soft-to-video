@@ -14,3 +14,5 @@ stressrnn @ git+https://github.com/dbklim/StressRNN.git
 # Тянет torch, поэтому не ставится по умолчанию; при отсутствии пакета
 # ранжирование откатывается на лексическое, пайплайн не падает.
 # sentence-transformers>=2.2.0
+
+filelock>=3.12.0
