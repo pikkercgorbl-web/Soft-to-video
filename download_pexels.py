@@ -880,8 +880,8 @@ async def prepare_text_with_gemini(text: str, client: genai.Client) -> str:
 # ---------------------------------------------------------------------------
 
 
-def generate_audio_with_chatterbox(text: str, output_path: Path) -> None:
-    """Отправляет текст на Chatterbox TTS-сервер и сохраняет бинарный ответ."""
+def build_chatterbox_payload(text: str, *, seed: int = 0, split_text: bool = True) -> dict:
+    """Shared request contract for production and controlled raw-audio comparisons."""
     payload = {
         "text": text,
         "voice_mode": TTS_VOICE_MODE,
@@ -892,8 +892,8 @@ def generate_audio_with_chatterbox(text: str, output_path: Path) -> None:
         "cfg_weight": TTS_CFG_WEIGHT,
         "chunk_size": TTS_CHUNK_SIZE,
         "output_format": "wav",
-        "seed": 0,
-        "split_text": True,
+        "seed": seed,
+        "split_text": split_text,
     }
 
     if TTS_VOICE_MODE == "clone":
@@ -901,9 +901,14 @@ def generate_audio_with_chatterbox(text: str, output_path: Path) -> None:
     else:
         payload["predefined_voice_id"] = TTS_VOICE_FILE
 
+    return payload
+
+
+def generate_audio_with_chatterbox(text: str, output_path: Path) -> None:
+    """Отправляет текст на Chatterbox TTS-сервер и сохраняет бинарный ответ."""
     response = requests.post(
         CHATTERBOX_TTS_URL,
-        json=payload,
+        json=build_chatterbox_payload(text),
         timeout=TTS_SERVER_TIMEOUT,
     )
 

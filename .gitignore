@@ -29,3 +29,5 @@ media_selection.log
 # Local project artifacts
 projects/
 .venv/
+# Local voice samples, server logs and controlled TTS comparisons
+debug/chatterbox_report/
